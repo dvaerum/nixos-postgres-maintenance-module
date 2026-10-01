@@ -259,3 +259,47 @@ def test_connectable_databases_excludes_template0(admin_conn: psycopg.Connection
     assert "postgres" in found
     assert "template0" not in found
     assert "template1" in found
+
+
+def test_glibc_stamp_appends_to_a_pre_existing_third_party_comment(
+    admin_conn: psycopg.Connection,
+) -> None:
+    """A comment left by anything else (a DBA note, another tool) must
+    survive -- COMMENT ON has no native append, so set_glibc_stamp()
+    has to read-modify-write rather than blindly overwrite."""
+    try:
+        admin_conn.execute("COMMENT ON DATABASE postgres IS 'do not drop -- owned by DBA team'")
+
+        set_glibc_stamp(admin_conn, "/nix/store/abc-glibc-locales-2.42")
+
+        comment = admin_conn.execute(
+            "SELECT shobj_description(oid, 'pg_database') FROM pg_database "
+            "WHERE datname = 'postgres'"
+        ).fetchone()[0]
+        assert "do not drop -- owned by DBA team" in comment
+        assert glibc_stamp(admin_conn) == "/nix/store/abc-glibc-locales-2.42"
+    finally:
+        # admin_conn's cluster is session-scoped and shared -- reset so
+        # later tests (e.g. asserting glibc_stamp() is None when never
+        # recorded) see a pristine postgres database again.
+        admin_conn.execute("COMMENT ON DATABASE postgres IS NULL")
+
+
+def test_glibc_stamp_updates_in_place_without_duplicating_on_second_write(
+    admin_conn: psycopg.Connection,
+) -> None:
+    try:
+        admin_conn.execute("COMMENT ON DATABASE postgres IS 'do not drop -- owned by DBA team'")
+        set_glibc_stamp(admin_conn, "/nix/store/abc-glibc-locales-2.42")
+
+        set_glibc_stamp(admin_conn, "/nix/store/def-glibc-locales-2.43")
+
+        comment = admin_conn.execute(
+            "SELECT shobj_description(oid, 'pg_database') FROM pg_database "
+            "WHERE datname = 'postgres'"
+        ).fetchone()[0]
+        assert "do not drop -- owned by DBA team" in comment
+        assert comment.count("collation-guard:glibcLocales=") == 1
+        assert glibc_stamp(admin_conn) == "/nix/store/def-glibc-locales-2.43"
+    finally:
+        admin_conn.execute("COMMENT ON DATABASE postgres IS NULL")

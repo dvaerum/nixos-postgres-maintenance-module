@@ -14,6 +14,7 @@ calling `REINDEX DATABASE` once.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -217,6 +218,7 @@ def process_database(conn: psycopg.Connection) -> DatabaseResult:
 
 
 GLIBC_STAMP_PREFIX = "collation-guard:glibcLocales="
+_STAMP_LINE_RE = re.compile(rf"^{re.escape(GLIBC_STAMP_PREFIX)}(\S+)$", re.MULTILINE)
 
 
 def connectable_databases(conn: psycopg.Connection) -> list[str]:
@@ -228,38 +230,59 @@ def connectable_databases(conn: psycopg.Connection) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
+def _database_comment(conn: psycopg.Connection, database: str) -> str | None:
+    row = conn.execute(
+        "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
+        (database,),
+    ).fetchone()
+    return str(row[0]) if row is not None and row[0] is not None else None
+
+
 def glibc_stamp(conn: psycopg.Connection) -> str | None:
     """The glibcLocales store path recorded the last time the C.UTF-8
     stamp was successfully advanced, or None if never recorded (a
-    brand-new cluster, or one that predates this guard). Stored via
-    COMMENT ON the `postgres` database -- a shared pg_shdescription
-    catalog entry, cluster-wide, survives pg_dumpall/pg_upgrade -- not a
-    $PGDATA file, which is one accidental `rm` or one backup that
-    forgot to include it away from losing the only evidence a reindex
-    is still owed. The *store path*, not a bare glibc version string,
-    is the comparison key: nixpkgs#245360 (fixed in commit 43da9e8ff)
-    showed the same glibc version producing a different, non-
-    deterministically-built locale archive for ~6 weeks in 2023, so a
-    version number alone isn't a safe comparison key."""
-    row = conn.execute(
-        "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = 'postgres'"
-    ).fetchone()
-    value = str(row[0]) if row is not None and row[0] is not None else None
-    if value is None or not value.startswith(GLIBC_STAMP_PREFIX):
+    brand-new cluster, or one that predates this guard). Stored as one
+    line within a COMMENT ON the `postgres` database -- a shared
+    pg_shdescription catalog entry, cluster-wide, survives
+    pg_dumpall/pg_upgrade -- not a $PGDATA file, which is one accidental
+    `rm` or one backup that forgot to include it away from losing the
+    only evidence a reindex is still owed. The *store path*, not a bare
+    glibc version string, is the comparison key: nixpkgs#245360 (fixed
+    in commit 43da9e8ff) showed the same glibc version producing a
+    different, non-deterministically-built locale archive for ~6 weeks
+    in 2023, so a version number alone isn't a safe comparison key.
+
+    Found by pattern within the comment, not by assuming the comment is
+    entirely ours -- see set_glibc_stamp()."""
+    comment = _database_comment(conn, "postgres")
+    if comment is None:
         return None
-    return value[len(GLIBC_STAMP_PREFIX) :]
+    match = _STAMP_LINE_RE.search(comment)
+    return match.group(1) if match else None
 
 
 def set_glibc_stamp(conn: psycopg.Connection, glibc_locales_path: str) -> None:
+    """Advances the stamp without disturbing anything else already in
+    the comment: if something else (a DBA note, another tool) left a
+    comment on `postgres`, our line is appended after it on a first
+    write and updated in place (not duplicated) on every write after
+    that -- never prepended, never replacing what's there. Postgres has
+    no native append/merge for COMMENT ON (it always sets the full
+    text), so this reads the current comment first."""
+    comment = _database_comment(conn, "postgres") or ""
+    new_line = f"{GLIBC_STAMP_PREFIX}{glibc_locales_path}"
+    if _STAMP_LINE_RE.search(comment):
+        updated = _STAMP_LINE_RE.sub(new_line, comment)
+    elif comment:
+        updated = f"{comment}\n{new_line}"
+    else:
+        updated = new_line
+
     # COMMENT ON is a utility statement -- Postgres's grammar requires a
     # literal string here, not a bind parameter (confirmed empirically:
     # `IS %s` raises a syntax error), so the value is escaped via
     # sql.Literal instead of the usual parameterized query.
-    conn.execute(
-        sql.SQL("COMMENT ON DATABASE postgres IS {}").format(
-            sql.Literal(f"{GLIBC_STAMP_PREFIX}{glibc_locales_path}")
-        )
-    )
+    conn.execute(sql.SQL("COMMENT ON DATABASE postgres IS {}").format(sql.Literal(updated)))
     conn.commit()
 
 
