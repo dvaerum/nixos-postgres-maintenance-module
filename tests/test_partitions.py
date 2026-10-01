@@ -11,10 +11,12 @@ from collections.abc import Iterator
 import psycopg
 import pytest
 
+from collation_guard import partitions
 from collation_guard.partitions import (
     has_rule,
     misplaced_rows,
     partition_repair_candidates,
+    repair_partition_table,
     repair_row,
 )
 
@@ -240,3 +242,41 @@ def test_has_rule_detects_a_rule_on_the_table(partitioned_db: psycopg.Connection
     assert has_rule(conn, "public", "child_a") is True
     # A sibling with no rule of its own must not be affected.
     assert has_rule(conn, "public", "child_b") is False
+
+
+def test_repair_partition_table_is_a_clean_single_pass_when_nothing_misplaced(
+    partitioned_db: psycopg.Connection,
+) -> None:
+    result = repair_partition_table(partitioned_db, "public", "parent", ["k"])
+    assert result.ok
+    assert result.repaired == 0
+    assert result.skipped_ruled_children == []
+
+
+def test_repair_partition_table_skips_a_ruled_child(partitioned_db: psycopg.Connection) -> None:
+    conn = partitioned_db
+    conn.execute("CREATE RULE no_op_insert AS ON INSERT TO child_a DO INSTEAD NOTHING")
+    conn.commit()
+
+    result = repair_partition_table(conn, "public", "parent", ["k"])
+
+    assert result.skipped_ruled_children == ["child_a"]
+
+
+def test_repair_partition_table_gives_up_after_max_attempts(
+    partitioned_db: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pathological case where every pass keeps finding something to
+    fix (can't be constructed with real data -- see the NOTE above --
+    so this proves the loop itself terminates and reports exhaustion,
+    via a stub that always reports one fake misplaced row)."""
+    monkeypatch.setattr(partitions, "misplaced_rows", lambda conn, schema, child: ["(0,1)"])
+    monkeypatch.setattr(
+        partitions, "repair_row", lambda conn, schema, table, child, key_columns, ctid: None
+    )
+
+    result = repair_partition_table(partitioned_db, "public", "parent", ["k"], max_attempts=5)
+
+    assert result.exhausted is True
+    assert not result.ok
+    assert result.repaired == 5 * 2  # 2 non-ruled children, 1 fake row each, every attempt
