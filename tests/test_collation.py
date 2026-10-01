@@ -254,6 +254,118 @@ def test_c_utf8_databases_flags_only_c_dot_locales(
         conn.execute('DROP DATABASE IF EXISTS "cg_libc"')
 
 
+@pytest.fixture
+def icu_test_db(c_locale_admin_conn: psycopg.Connection, c_locale_pg_dsn: str) -> Iterator[str]:
+    """ICU is a genuinely different provider from every libc-based
+    fixture above -- datlocprovider='i', its own independent version
+    namespace (e.g. '153.128', the underlying ICU library version),
+    unrelated to glibc's. Needs the dedicated C-locale cluster, same
+    reason as test_c_utf8_databases_flags_only_c_dot_locales: the main
+    cluster's template0 gets REFRESH COLLATION VERSION'd by
+    test_template0_refresh_without_connecting_to_it earlier in this
+    file, and creating a cross-provider (icu) database from that
+    *refreshed* template0 then fails with a genuine, confirmed Postgres
+    error ("template database 'template0' has a collation version
+    mismatch") that a pristine, never-refreshed template0 (this
+    cluster) doesn't hit -- confirmed empirically both ways."""
+    name = "cg_test_icu"
+    c_locale_admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    c_locale_admin_conn.execute(
+        f"CREATE DATABASE \"{name}\" LOCALE_PROVIDER icu ICU_LOCALE 'en-US' TEMPLATE template0"
+    )
+    try:
+        yield name
+    finally:
+        c_locale_admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_process_database_is_noop_when_not_stale_icu(
+    c_locale_pg_dsn: str, icu_test_db: str
+) -> None:
+    """Proves the Postgres-tracked mismatch path works under the icu
+    provider too, not just libc -- the normal case where datcollversion
+    genuinely does track the real ICU library version, as opposed to
+    the documented ICU-22544-style blind spot (README's 'Known
+    limitations') where it doesn't. Before this test, every test in
+    this file ran exclusively under libc."""
+    with _connect(c_locale_pg_dsn, icu_test_db) as conn:
+        assert not database_collation_is_stale(conn)
+        result = process_database(conn)
+        assert result.ok
+        assert result.reindexed == []
+        assert result.failed == []
+
+
+def test_process_database_reindexes_and_refreshes_on_mismatch_icu(
+    c_locale_pg_dsn: str, icu_test_db: str
+) -> None:
+    with _connect(c_locale_pg_dsn, icu_test_db) as conn:
+        conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text)")
+        conn.execute("CREATE INDEX widgets_name_idx ON widgets (name)")
+        conn.execute("INSERT INTO widgets (name) VALUES ('alpha'), ('beta'), ('gamma')")
+        conn.commit()
+
+        _fake_stale(conn, icu_test_db)
+        conn.commit()
+
+        assert database_collation_is_stale(conn)
+
+        result = process_database(conn)
+
+        assert result.ok
+        assert result.reindexed == ["widgets"]
+        assert result.failed == []
+        assert not database_collation_is_stale(conn)
+
+
+def test_c_utf8_databases_excludes_icu(
+    c_locale_admin_conn: psycopg.Connection, icu_test_db: str
+) -> None:
+    # datlocprovider='i', not 'c' -- never matches c_utf8_databases()'s
+    # query regardless of its locale string.
+    assert icu_test_db not in c_utf8_databases(c_locale_admin_conn)
+
+
+@pytest.fixture
+def posix_test_db(
+    c_locale_admin_conn: psycopg.Connection, c_locale_pg_dsn: str
+) -> Iterator[str]:
+    """POSIX is byte-for-byte identical to C as far as Postgres's own
+    versioning is concerned (datcollversion stays NULL, same as a plain
+    C database) -- this project's module docstring already states this
+    is true for 'C/C.*/POSIX' collectively, but nothing exercised the
+    POSIX spelling specifically until now. Uses the C-locale cluster
+    for the same reason icu_test_db does -- see its docstring."""
+    name = "cg_test_posix"
+    c_locale_admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    c_locale_admin_conn.execute(
+        f"CREATE DATABASE \"{name}\" LOCALE_PROVIDER libc LOCALE 'POSIX' TEMPLATE template0"
+    )
+    try:
+        yield name
+    finally:
+        c_locale_admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_process_database_is_noop_for_posix_locale(
+    c_locale_pg_dsn: str, posix_test_db: str
+) -> None:
+    with _connect(c_locale_pg_dsn, posix_test_db) as conn:
+        assert not database_collation_is_stale(conn)
+        result = process_database(conn)
+        assert result.ok
+        assert result.reindexed == []
+        assert result.failed == []
+
+
+def test_c_utf8_databases_excludes_posix(
+    c_locale_admin_conn: psycopg.Connection, posix_test_db: str
+) -> None:
+    # datcollate='POSIX' doesn't match the 'C.%' pattern -- distinct
+    # from the C.UTF-8 case already covered above.
+    assert posix_test_db not in c_utf8_databases(c_locale_admin_conn)
+
+
 def test_connectable_databases_excludes_template0(admin_conn: psycopg.Connection) -> None:
     found = connectable_databases(admin_conn)
     assert "postgres" in found
