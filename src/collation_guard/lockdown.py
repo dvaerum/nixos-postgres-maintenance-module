@@ -17,9 +17,12 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 
 import psycopg
+
+_RELOAD_CONFIRM_TIMEOUT = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +84,22 @@ class LockdownManager:
             else:
                 self._locked.discard(request.dbname)
             self._write_file()
+            before = self._conn.execute("SELECT pg_conf_load_time()").fetchone()
             self._conn.execute("SELECT pg_reload_conf()")
+            # pg_reload_conf() only requests a reload (SIGHUP) -- the
+            # postmaster re-reads pg_hba.conf asynchronously, so under
+            # rapid lock/unlock traffic the SQL call can return before
+            # the new rules are actually in effect (confirmed
+            # empirically: a brand-new connection could occasionally
+            # still succeed/fail against the stale rules for a short
+            # window). pg_conf_load_time() is the authoritative signal
+            # Postgres itself updates once a reload has genuinely
+            # completed -- poll until it changes before treating this
+            # request as applied. Since this manager is the single
+            # writer and processes requests strictly FIFO, there's
+            # never a second reload in flight while polling for this
+            # one's completion.
+            self._wait_for_reload(before)
             if request.action == "lock":
                 self._conn.execute(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -89,6 +107,18 @@ class LockdownManager:
                     (request.dbname,),
                 )
             request.done.set()
+
+    def _wait_for_reload(self, before: object) -> None:
+        deadline = time.monotonic() + _RELOAD_CONFIRM_TIMEOUT
+        while time.monotonic() < deadline:
+            after = self._conn.execute("SELECT pg_conf_load_time()").fetchone()
+            if after != before:
+                return
+            time.sleep(0.001)
+        raise RuntimeError(
+            f"pg_hba.conf reload did not complete within {_RELOAD_CONFIRM_TIMEOUT}s "
+            "(pg_conf_load_time() never advanced)"
+        )
 
     def _write_file(self) -> None:
         if not self._locked:

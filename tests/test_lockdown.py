@@ -7,6 +7,8 @@ CONNECTION LIMIT) and why a single writer thread.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import psycopg
@@ -31,11 +33,12 @@ def manager(pg_dsn: str, lockdown_conf_path: Path):
         lockdown_conf_path.unlink(missing_ok=True)
 
 
-def _can_connect(host: str, port: str, dbname: str, user: str) -> bool:
+def _can_connect(host: str, port: str, dbname: str, user: str | None = None) -> bool:
+    conninfo = f"host={host} port={port} dbname={dbname}"
+    if user is not None:
+        conninfo += f" user={user}"
     try:
-        with psycopg.connect(
-            f"host={host} port={port} dbname={dbname} user={user}", prepare_threshold=None
-        ):
+        with psycopg.connect(conninfo, prepare_threshold=None):
             return True
     except psycopg.OperationalError:
         return False
@@ -73,6 +76,45 @@ def test_lock_two_databases_unlock_one_leaves_the_other_locked(
         for name in (name_a, name_b):
             admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
         admin_conn.execute("DROP ROLE IF EXISTS cg_lockdown_test_role2")
+
+
+def test_concurrent_lock_unlock_from_multiple_threads_is_race_free(
+    manager: LockdownManager, pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path: Path
+) -> None:
+    """More callers than maxParallelDatabases would ever actually use,
+    hammering lock()/unlock() for distinct databases concurrently --
+    proves the single-writer-thread design eliminates the file-write
+    race, not just "usually works." Each worker's own lock()/unlock()
+    round-trips are independently verified via real connection
+    attempts (not internal state), and by the end every database is
+    unlocked again -- the only well-formed resting state."""
+    host, port = _host_port(pg_dsn)
+    names = [f"cg_lockdown_test_concurrent_{i}" for i in range(8)]
+    for name in names:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute(f'CREATE DATABASE "{name}"')
+    barrier = threading.Barrier(len(names))
+
+    def worker(name: str) -> None:
+        for _ in range(3):
+            barrier.wait()
+            manager.lock(name)
+            assert not _can_connect(host, port, name)
+            manager.unlock(name)
+            assert _can_connect(host, port, name)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(names)) as executor:
+            futures = [executor.submit(worker, name) for name in names]
+            for f in futures:
+                f.result()
+
+        # every database ended unlocked -- the only well-formed resting
+        # state for the file (absent, not an empty/stale reject line).
+        assert not lockdown_conf_path.exists()
+    finally:
+        for name in names:
+            admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
 
 def test_lock_terminates_existing_sessions_but_excludes_the_guards_own(
