@@ -72,9 +72,29 @@
           inherit pkgs;
           nixosModule = self;
         };
+
+        # Two full Postgres builds, each linked against a different ICU
+        # release -- the permanent form of the ICU-drift experiment (see
+        # docs/decisions/0008). Only the icu input differs; everything
+        # else about the build is the standard nixpkgs postgresql_17.
+        postgresqlIcu72 = pkgs.postgresql_17.override { icu = pkgs.icu72; };
+        postgresqlIcu73 = pkgs.postgresql_17.override { icu = pkgs.icu73; };
+
+        icuDriftTest = pkgs.testers.nixosTest (
+          import ./tests/nixos/icu-drift.nix {
+            inherit postgresqlIcu72 postgresqlIcu73;
+            collationGuardPackage = collation-guard;
+          }
+        );
       in
       {
         packages.default = collation-guard;
+
+        # Deliberately NOT a `checks` entry -- see docs/decisions/0008 for
+        # why this heavy, multi-Postgres-rebuild tier stays out of
+        # `nix flake check`/CI and is run by hand instead:
+        #   nix build .#icuDriftTest -L
+        packages.icuDriftTest = icuDriftTest;
 
         checks = {
           unitTests = collation-guard;
