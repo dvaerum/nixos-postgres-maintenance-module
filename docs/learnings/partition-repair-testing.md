@@ -51,6 +51,13 @@ load-bearing halves separately instead:
 
 A real end-to-end reproduction of a stale-collation misplaced row would
 need two genuinely different glibc/ICU builds compared against the same
-on-disk data -- out of scope for this project's test suite; the
-`systemd-nspawn` container tier doesn't close this gap either, since it
-still runs a single nixpkgs closure's glibc.
+on-disk data. **Closed for ICU** by `tests/nixos/icu-drift.nix` and
+`docs/decisions/0008-icu-drift-test.md`: two full Postgres builds, each
+linked against a different ICU release, swapped against the same
+on-disk `$PGDATA` -- proves a genuinely misplaced row (confirmed via a
+live collation-comparison change, not just a `collversion` bump) is
+correctly detected and repaired by the real `collation-guard` CLI.
+**Still open for glibc** -- see 0008's "Why ICU, not glibc" for why
+that half stays out of scope: glibc is the C library the entire
+nixpkgs closure links against, not a single swappable override the way
+`postgresql_17.override { icu = ...; }` is.

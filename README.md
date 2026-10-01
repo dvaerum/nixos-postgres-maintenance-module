@@ -202,14 +202,17 @@ collation-guard --dry-run # list partition-repair candidates across the cluster,
   normal case — but a documented, still-open PG deadlock pattern exists
   if this module is ever invoked against an already-live cluster with
   concurrent writers.
-- **No real-drift test coverage for row-level partition repair.** A
-  genuinely misplaced row only exists because the same collation's
-  comparison behavior changed between validation time and now (an
-  actual glibc/ICU version change) — not reproducible in a
-  single-locale test sandbox. See
-  `docs/learnings/partition-repair-testing.md` for what was tried and
-  why; the test suite instead proves the mechanism's load-bearing parts
-  separately.
+- **No real-drift test coverage for row-level partition repair under
+  glibc.** Closed for ICU: `tests/nixos/icu-drift.nix` builds two
+  Postgres binaries against two different ICU releases and swaps them
+  against the same on-disk `$PGDATA`, proving a row that's genuinely
+  misplaced by a real collation-comparison change (not just a
+  `collversion` bump) is correctly detected and repaired end-to-end —
+  see `docs/decisions/0008-icu-drift-test.md`. Still open for glibc: it's
+  the C library the entire nixpkgs closure links against, not a single
+  swappable override the way Postgres's `icu` dependency is; see 0008's
+  "Why ICU, not glibc" and `docs/learnings/partition-repair-testing.md`
+  for the full reasoning.
 
 See `docs/decisions/` for the full reasoning behind each piece, and
 `docs/learnings/` for other non-obvious findings from building this.
@@ -220,6 +223,9 @@ See `docs/decisions/` for the full reasoning behind each piece, and
 nix develop         # python3, psycopg, pytest, ruff, mypy, postgresql on PATH
 pytest               # fast tier: logic tests against an ephemeral initdb/pg_ctl cluster
 nix flake check      # fast tier + slow (systemd-nspawn) tier + the Nix package build
+nix build .#icuDriftTest -L   # heaviest tier: real ICU-drift test, two full Postgres
+                               # rebuilds -- not part of `nix flake check`/CI, see
+                               # docs/decisions/0008; run by hand only
 nix fmt              # format both Nix and Python
 nix-build generate-doc.nix && cp result docs/options.md   # regenerate the option reference
 ```

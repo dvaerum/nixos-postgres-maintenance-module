@@ -19,7 +19,9 @@ flake.nix          nixosModules.default, packages.default, devShells.default, ch
 pyproject.toml     single source of truth for the Python package (see "Versioning" below)
 src/collation_guard/   the package: main.py (entry point), collation.py, partitions.py
 tests/              fast tier: pytest + ephemeral initdb/pg_ctl cluster (no systemd)
-tests/nixos/        slow tier: systemd-nspawn nixosTest containers (wiring/ordering only)
+tests/nixos/        slow tier: systemd-nspawn nixosTest containers (wiring/ordering,
+                    plus icu-drift.nix -- a real multi-Postgres-build drift test,
+                    exposed as packages.icuDriftTest, not wired into `checks`/CI)
 nixosModule/        services.postgresqlCollationGuard.* options + systemd unit wiring
 docs/decisions/      one ADR per real design decision, with sources cited
 docs/learnings/       cross-cutting operational knowledge, not tied to one decision
