@@ -5,6 +5,7 @@ as the real systemd ExecStart does, just without systemd itself.
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Iterator
 
@@ -438,3 +439,87 @@ def test_run_postrun_hook_fires_even_when_a_database_already_failed(
 
     assert not report.success
     assert marker.exists(), "postRun must fire regardless of outcome, unlike onSuccess"
+
+
+def _hooks_file_with_one_on_failure_hook(tmp_path, hook_path: str, *hook_args: str) -> str:
+    path = tmp_path / "hooks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "onFailure": [
+                    {
+                        "path": hook_path,
+                        "args": list(hook_args),
+                        "environment": {},
+                        "environmentFile": None,
+                        "blockOnFailure": True,
+                    }
+                ]
+            }
+        )
+    )
+    return str(path)
+
+
+def test_run_on_failure_reads_last_context_and_fires_hooks(tmp_path) -> None:
+    context_file = tmp_path / "context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "databases_processed": ["postgres"],
+                "databases_repaired": [],
+                "failures": [
+                    {"database": "mydb", "relation": "widgets", "error": "REINDEX failed"}
+                ],
+                "success": False,
+            }
+        )
+    )
+    out = tmp_path / "recorded-error.txt"
+    script = (
+        "import os, sys; open(sys.argv[1], 'w').write(os.environ['COLLATION_GUARD_ERROR'])"
+    )
+    hooks_file = _hooks_file_with_one_on_failure_hook(
+        tmp_path, sys.executable, "-c", script, str(out)
+    )
+
+    exit_code = main.run_on_failure(hooks_file, str(context_file))
+
+    assert exit_code == 0
+    assert "mydb.widgets: REINDEX failed" in out.read_text()
+
+
+def test_run_on_failure_falls_back_to_a_generic_error_when_no_context_file_exists(
+    tmp_path,
+) -> None:
+    """A crash on the very first-ever run, before anything was ever
+    written -- must not itself crash."""
+    missing_context_file = tmp_path / "does-not-exist.json"
+    out = tmp_path / "recorded-error.txt"
+    script = (
+        "import os, sys; open(sys.argv[1], 'w').write(os.environ['COLLATION_GUARD_ERROR'])"
+    )
+    hooks_file = _hooks_file_with_one_on_failure_hook(
+        tmp_path, sys.executable, "-c", script, str(out)
+    )
+
+    exit_code = main.run_on_failure(hooks_file, str(missing_context_file))
+
+    assert exit_code == 0
+    assert out.read_text()  # some generic, non-empty message
+
+
+def test_run_on_failure_blocking_hook_failure_makes_the_process_exit_nonzero(tmp_path) -> None:
+    context_file = tmp_path / "context.json"
+    context_file.write_text(
+        json.dumps(
+            {"databases_processed": [], "databases_repaired": [], "failures": [], "success": False}
+        )
+    )
+    hooks_file = _hooks_file_with_one_on_failure_hook(
+        tmp_path, sys.executable, "-c", "import sys; sys.exit(1)"
+    )
+
+    exit_code = main.run_on_failure(hooks_file, str(context_file))
+
+    assert exit_code == 1

@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 import psycopg
 
 from . import collation, partitions
-from .hooks import Hook, HooksConfig, run_hook
+from .hooks import Hook, HooksConfig, load_hooks, run_hook
 
 logger = logging.getLogger("collation_guard")
 
@@ -269,6 +269,39 @@ def run(
     return report
 
 
+def _recover_last_context(context_file: str) -> tuple[dict[str, object] | None, str]:
+    """Reads the context file the previous run wrote (if any) to
+    recover what failed. A missing or unreadable file -- e.g. a crash
+    on the very first-ever run, before anything was ever written --
+    falls back to a generic message rather than raising."""
+    try:
+        with open(context_file) as f:
+            data: dict[str, object] = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, "collation-guard failed or crashed (no prior run context available)"
+
+    failures = data.get("failures", [])
+    assert isinstance(failures, list)
+    if not failures:
+        return data, "collation-guard failed or crashed (no failures recorded in last context)"
+    error = "; ".join(f"{f['database']}.{f['relation']}: {f['error']}" for f in failures)
+    return data, error
+
+
+def run_on_failure(hooks_file: str, context_file: str) -> int:
+    """Second entry point, invoked by the postgresql-collation-guard-
+    on-failure.service companion unit after the main run failed or
+    crashed outright (systemd's OnFailure=, the one guarantee a dead
+    process can't arrange for itself). Reads the same hooks file as the
+    main run and runs hooks.onFailure through the exact same
+    run_hook() as every other stage -- no separate implementation."""
+    hooks = load_hooks(hooks_file)
+    context, error = _recover_last_context(context_file)
+    report = RunReport()
+    _run_hooks(hooks.on_failure, "on_failure", report, context=context, error=error)
+    return 0 if report.success else 1
+
+
 def _write_context_file(path: str, report: RunReport) -> None:
     # Best-effort: a hook-context write failure is a hook-delivery
     # problem, not evidence the guard itself failed -- the exit code
@@ -297,7 +330,24 @@ def main() -> int:
         action="store_true",
         help="list partition-repair candidates across the cluster without changing anything",
     )
+    parser.add_argument(
+        "--on-failure",
+        action="store_true",
+        help=(
+            "internal: invoked by the postgresql-collation-guard-on-failure.service "
+            "companion unit after the main run failed or crashed -- not meant to be run "
+            "directly"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.on_failure:
+        return run_on_failure(
+            os.environ["COLLATION_GUARD_HOOKS_FILE"], os.environ["COLLATION_GUARD_CONTEXT_FILE"]
+        )
+
+    hooks_file = os.environ.get("COLLATION_GUARD_HOOKS_FILE")
+    hooks = load_hooks(hooks_file) if hooks_file else None
 
     report = run(
         os.environ["PGHOST"],
@@ -305,6 +355,7 @@ def main() -> int:
         glibc_locales_path=os.environ["GLIBC_LOCALES_PATH"],
         partition_repair_enabled=os.environ["COLLATION_GUARD_PARTITION_REPAIR_ENABLE"] == "true",
         max_repair_attempts=int(os.environ["COLLATION_GUARD_MAX_REPAIR_ATTEMPTS"]),
+        hooks=hooks,
         dry_run=args.dry_run,
     )
 
