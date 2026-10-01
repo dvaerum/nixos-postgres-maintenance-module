@@ -212,6 +212,9 @@ def run(
     for dbname in databases:
         _process_database(host, port, dbname, partition_repair_enabled, max_repair_attempts, report)
 
+    if report.success:
+        _run_global_hooks(hooks.on_success, "on_success", report)
+
     return report
 
 
