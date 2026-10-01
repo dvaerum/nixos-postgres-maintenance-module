@@ -9,6 +9,14 @@ let
   pgCfg = config.services.postgresql;
 
   contextFile = "/run/postgresql-collation-guard/last-run.json";
+  lockdownFile = "/run/postgresql-collation-guard/lockdown.conf";
+
+  # Needed whenever EITHER onFailure hooks are configured OR
+  # connectionLockdown is enabled (its default) -- a crash mid-lock
+  # must still be cleaned up even if nobody configured a notification
+  # hook at all, since OnFailure= is the only way a dead process can
+  # trigger anything for itself.
+  needsOnFailureUnit = cfg.hooks.onFailure != [ ] || cfg.connectionLockdown.enable;
 
   # Extracted to its own file (nixosModule/validate-hook.nix) so it's
   # testable in isolation -- see tests/validate-hook.nix.
@@ -57,6 +65,18 @@ in
       "d /run/postgresql-collation-guard 0750 ${pgCfg.superUser} postgres - -"
     ];
 
+    # include_if_exists is re-resolved on every pg_reload_conf(), unlike
+    # hba_file itself (fixed at server start, and NixOS points it at a
+    # read-only Nix store path) -- this is what lets LockdownManager
+    # reject/restore access at runtime with no restart. The file
+    # doesn't exist on a normal day, so this is a silent no-op unless
+    # something is actually locked. mkBefore so it's checked ahead of
+    # every other rule (first match wins in pg_hba.conf). See
+    # docs/decisions/0007.
+    services.postgresql.authentication = lib.mkIf cfg.connectionLockdown.enable (
+      lib.mkBefore "include_if_exists ${lockdownFile}"
+    );
+
     systemd.services.postgresql-collation-guard = {
       description = "Reindex/refresh any database whose collation library version changed, and repair drifted text-partition bounds";
 
@@ -73,6 +93,8 @@ in
         COLLATION_GUARD_MAX_PARALLEL_DATABASES = toString cfg.maxParallelDatabases;
         COLLATION_GUARD_CONTEXT_FILE = contextFile;
         COLLATION_GUARD_HOOKS_FILE = "${hooksFile}";
+        COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
+        COLLATION_GUARD_CONNECTION_LOCKDOWN_ENABLE = lib.boolToString cfg.connectionLockdown.enable;
       };
 
       serviceConfig = {
@@ -89,24 +111,29 @@ in
         ExecStart = lib.getExe cfg.package;
       };
     }
-    // lib.optionalAttrs (cfg.hooks.onFailure != [ ]) {
+    // lib.optionalAttrs needsOnFailureUnit {
       unitConfig.OnFailure = [ "postgresql-collation-guard-on-failure.service" ];
     };
 
-    # Separate companion unit for the onFailure hooks, triggered via the
-    # main unit's OnFailure= above -- this fires on ANY failure mode
-    # (non-zero exit, crash, kill, timeout), not just a clean non-zero
-    # exit a plain ExecStopPost could also observe, which is the one
-    # thing a plain post-run hook can't guarantee. Its ExecStart is a
-    # second, equally small entry point into the same binary
-    # (--on-failure), running the exact same run_hook()/
-    # merge_environment() code as every other stage -- not a separate
-    # implementation.
-    systemd.services."postgresql-collation-guard-on-failure" = lib.mkIf (cfg.hooks.onFailure != [ ]) {
+    # Separate companion unit, triggered via the main unit's
+    # OnFailure= above -- this fires on ANY failure mode (non-zero
+    # exit, crash, kill, timeout), not just a clean non-zero exit a
+    # plain ExecStopPost could also observe, which is the one thing a
+    # plain post-run hook can't guarantee. Its ExecStart is a second,
+    # equally small entry point into the same binary (--on-failure):
+    # first an unconditional lockdown-file cleanup (independent of
+    # whether any onFailure hooks are configured at all -- see
+    # docs/decisions/0007), then the exact same run_hook()/
+    # merge_environment() code as every other stage for any configured
+    # onFailure hooks -- not a separate implementation.
+    systemd.services."postgresql-collation-guard-on-failure" = lib.mkIf needsOnFailureUnit {
       description = "On-failure hooks for postgresql-collation-guard.service";
       environment = {
         COLLATION_GUARD_HOOKS_FILE = "${hooksFile}";
         COLLATION_GUARD_CONTEXT_FILE = contextFile;
+        COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
+        PGHOST = "/run/postgresql";
+        PGPORT = toString pgCfg.settings.port;
       };
       serviceConfig = {
         Type = "oneshot";

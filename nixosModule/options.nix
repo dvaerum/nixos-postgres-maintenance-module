@@ -27,7 +27,10 @@ let
           (`COLLATION_GUARD_STAGE`/`DATABASE`/`CONTEXT`/`ERROR`) -- a key
           defined by more than one of those three sources is a hard
           error at run time (`EnvironmentCollisionError`), never a
-          silent override. See docs/decisions/0006.
+          silent override. `COLLATION_GUARD_CONTEXT` is always present
+          and always valid JSON, on every stage (an empty `{}` where
+          there's nothing yet to report) -- no need to check whether it
+          exists before parsing it. See docs/decisions/0006.
         '';
       };
 
@@ -82,6 +85,29 @@ in
         parallelism could make things slower, not faster, on a cluster
         with many databases).
       '';
+    };
+
+    connectionLockdown = {
+      enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Reject new connections to a database for exactly the
+          duration it's actively being reindexed/repaired, and
+          terminate any session already connected to it at that
+          moment -- closing the gap where a client not itself ordered
+          after `postgresql-setup.service`/`postgresql.target` (local
+          or remote, since `postgresql.service` is already accepting
+          connections by the time this guard runs) could otherwise
+          connect against inconsistent state. A database with nothing
+          to fix is never locked. Default `true` since this closes a
+          real correctness gap, but every existing deployment gets this
+          behavior on the next upgrade with no config change -- turn it
+          off here if there's a specific reason to allow concurrent
+          connections during the guard's run. See
+          docs/decisions/0007-connection-lockdown-during-repair.md.
+        '';
+      };
     };
 
     partitionRepair = {
