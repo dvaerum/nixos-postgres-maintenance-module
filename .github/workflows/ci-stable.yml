@@ -1,0 +1,79 @@
+name: CI (current stable)
+
+# Separate from ci.yml on purpose: this checks the project against
+# whatever the current stable NixOS release branch happens to be right
+# now, overriding the nixpkgs input for this run only -- the real
+# flake.lock/unstable pin (see flake.nix) is never touched. A failure
+# here means "breaks on stable," distinguishable at a glance from a
+# regular ci.yml failure.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  flake-check-stable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes auto-allocate-uids cgroups
+            auto-allocate-uids = true
+
+      - name: Resolve current stable NixOS release branch
+        id: stable
+        run: |
+          set -euo pipefail
+
+          # NixOS stable releases are nixos-YY.MM branches, cut twice a
+          # year (05/11), typically appearing a few weeks into the
+          # named month -- not on the 1st. Date arithmetic alone can't
+          # know whether this half's branch has actually been cut yet,
+          # so it only produces a first guess; git ls-remote against
+          # the real repo is the actual source of truth, with one
+          # fallback to the previous half if the guess isn't out yet.
+
+          exists() {
+            git ls-remote --exit-code --heads https://github.com/NixOS/nixpkgs.git "nixos-$1" >/dev/null 2>&1
+          }
+
+          previous_half() {
+            local yy="${1%%.*}" mm="${1##*.}"
+            if [ "$mm" = "11" ]; then
+              echo "${yy}.05"
+            else
+              printf '%02d.11\n' $(( 10#$yy - 1 ))
+            fi
+          }
+
+          yy=$(date -u +%y)
+          month=$(date -u +%-m)
+
+          if [ "$month" -ge 11 ]; then
+            candidate="${yy}.11"
+          elif [ "$month" -ge 5 ]; then
+            candidate="${yy}.05"
+          else
+            candidate=$(printf '%02d.11' $(( 10#$yy - 1 )))
+          fi
+
+          if ! exists "$candidate"; then
+            echo "nixos-$candidate doesn't exist yet, falling back to the previous half"
+            candidate=$(previous_half "$candidate")
+          fi
+
+          if ! exists "$candidate"; then
+            echo "::error::neither the computed candidate nor its fallback (nixos-$candidate) exist on NixOS/nixpkgs"
+            exit 1
+          fi
+
+          echo "resolved stable branch: nixos-$candidate"
+          echo "branch=nixos-$candidate" >> "$GITHUB_OUTPUT"
+
+      - name: nix flake check against current stable
+        run: |
+          nix flake check -L --override-input nixpkgs "github:NixOS/nixpkgs/${{ steps.stable.outputs.branch }}"
