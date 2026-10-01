@@ -107,6 +107,7 @@ def _process_database(
     partition_repair_enabled: bool,
     max_attempts: int,
     hooks: HooksConfig,
+    manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
 ) -> RunReport:
     """Processes one database in complete isolation, returning its own
     RunReport rather than mutating a shared one -- lets run() call this
@@ -127,26 +128,43 @@ def _process_database(
     failures_before = len(report.failures)
 
     with _connect(host, port, dbname) as conn:
-        result = collation.process_database(conn)
-        if result.reindexed:
-            logger.info(
-                "%s: reindexed %d table(s) for a Postgres-tracked collation mismatch: %s",
-                dbname,
-                len(result.reindexed),
-                ", ".join(result.reindexed),
-            )
-            report.databases_repaired.append(dbname)
-        for table in result.failed:
-            report.failures.append(
-                Failure(database=dbname, relation=table, error="REINDEX failed")
-            )
-        if result.refresh_error is not None:
-            report.failures.append(
-                Failure(database=dbname, relation=dbname, error=result.refresh_error)
-            )
-
+        # Cheap, read-only checks decide whether this database needs
+        # locking at all -- a database with nothing to fix is never
+        # locked (no lock()/unlock() call, no entry in the lockdown
+        # file), matching this project's own existing detection logic
+        # rather than inventing a new one.
+        needs_lock = collation.database_collation_is_stale(conn) or bool(
+            collation.stale_named_collations(conn)
+        )
         if partition_repair_enabled:
-            _repair_partitions_in(conn, dbname, max_attempts, report)
+            needs_lock = needs_lock or bool(partitions.partition_repair_candidates(conn))
+
+        if needs_lock:
+            manager.lock(dbname)
+        try:
+            result = collation.process_database(conn)
+            if result.reindexed:
+                logger.info(
+                    "%s: reindexed %d table(s) for a Postgres-tracked collation mismatch: %s",
+                    dbname,
+                    len(result.reindexed),
+                    ", ".join(result.reindexed),
+                )
+                report.databases_repaired.append(dbname)
+            for table in result.failed:
+                report.failures.append(
+                    Failure(database=dbname, relation=table, error="REINDEX failed")
+                )
+            if result.refresh_error is not None:
+                report.failures.append(
+                    Failure(database=dbname, relation=dbname, error=result.refresh_error)
+                )
+
+            if partition_repair_enabled:
+                _repair_partitions_in(conn, dbname, max_attempts, report)
+        finally:
+            if needs_lock:
+                manager.unlock(dbname)
 
     report.databases_processed.append(dbname)
 
@@ -262,71 +280,86 @@ def run(
     hooks: HooksConfig | None = None,
     max_parallel_databases: int = 4,
     dry_run: bool = False,
+    lockdown_path: str | None = None,
 ) -> RunReport:
     report = RunReport()
     hooks = hooks or HooksConfig()
-
-    if not dry_run and not _run_hooks(
-        hooks.pre_start, "pre_start", report, context=_report_context(report)
-    ):
-        return report
-
-    with _connect(host, port, "postgres") as admin_conn:
-        databases = collation.connectable_databases(admin_conn)
-
-        if dry_run:
-            for dbname in databases:
-                with _connect(host, port, dbname) as conn:
-                    for schema, table in partitions.partition_repair_candidates(conn):
-                        print(f"{dbname}.{schema}.{table}")
-            return report
-
-        template0_error = collation.process_template0(admin_conn)
-        if template0_error is not None:
-            report.failures.append(
-                Failure(database="template0", relation="template0", error=template0_error)
-            )
-
-    _process_glibc_stamp(host, port, glibc_locales_path, report)
-
-    # Each worker gets its own psycopg.Connection and its own RunReport
-    # (see _process_database's docstring) -- no shared mutable state
-    # between threads, so no locking needed. Submitted in sorted order
-    # and merged in sorted order too, so the final report is
-    # deterministic regardless of which thread actually finishes first.
-    with ThreadPoolExecutor(max_workers=max_parallel_databases) as executor:
-        futures = [
-            executor.submit(
-                _process_database,
-                host,
-                port,
-                dbname,
-                partition_repair_enabled,
-                max_repair_attempts,
-                hooks,
-            )
-            for dbname in sorted(databases)
-        ]
-        for future in futures:
-            sub_report = future.result()
-            report.databases_processed.extend(sub_report.databases_processed)
-            report.databases_repaired.extend(sub_report.databases_repaired)
-            report.failures.extend(sub_report.failures)
-
-    report.databases_processed.sort()
-    report.databases_repaired.sort()
-
-    if report.success:
-        _run_hooks(hooks.on_success, "on_success", report, context=_report_context(report))
-
-    # postRun fires regardless of outcome -- unlike onSuccess, which is
-    # deliberately gated on a clean run.
-    post_run_error = None if report.success else _summarize_failures(report)
-    _run_hooks(
-        hooks.post_run, "post_run", report, context=_report_context(report), error=post_run_error
+    manager: lockdown.LockdownManager | lockdown.NullLockdownManager = (
+        lockdown.LockdownManager(host, port, lockdown_path)
+        if lockdown_path is not None
+        else lockdown.NullLockdownManager()
     )
 
-    return report
+    try:
+        if not dry_run and not _run_hooks(
+            hooks.pre_start, "pre_start", report, context=_report_context(report)
+        ):
+            return report
+
+        with _connect(host, port, "postgres") as admin_conn:
+            databases = collation.connectable_databases(admin_conn)
+
+            if dry_run:
+                for dbname in databases:
+                    with _connect(host, port, dbname) as conn:
+                        for schema, table in partitions.partition_repair_candidates(conn):
+                            print(f"{dbname}.{schema}.{table}")
+                return report
+
+            template0_error = collation.process_template0(admin_conn)
+            if template0_error is not None:
+                report.failures.append(
+                    Failure(database="template0", relation="template0", error=template0_error)
+                )
+
+        _process_glibc_stamp(host, port, glibc_locales_path, report)
+
+        # Each worker gets its own psycopg.Connection and its own
+        # RunReport (see _process_database's docstring) -- no shared
+        # mutable state between threads, so no locking needed.
+        # Submitted in sorted order and merged in sorted order too, so
+        # the final report is deterministic regardless of which thread
+        # actually finishes first.
+        with ThreadPoolExecutor(max_workers=max_parallel_databases) as executor:
+            futures = [
+                executor.submit(
+                    _process_database,
+                    host,
+                    port,
+                    dbname,
+                    partition_repair_enabled,
+                    max_repair_attempts,
+                    hooks,
+                    manager,
+                )
+                for dbname in sorted(databases)
+            ]
+            for future in futures:
+                sub_report = future.result()
+                report.databases_processed.extend(sub_report.databases_processed)
+                report.databases_repaired.extend(sub_report.databases_repaired)
+                report.failures.extend(sub_report.failures)
+
+        report.databases_processed.sort()
+        report.databases_repaired.sort()
+
+        if report.success:
+            _run_hooks(hooks.on_success, "on_success", report, context=_report_context(report))
+
+        # postRun fires regardless of outcome -- unlike onSuccess, which is
+        # deliberately gated on a clean run.
+        post_run_error = None if report.success else _summarize_failures(report)
+        _run_hooks(
+            hooks.post_run,
+            "post_run",
+            report,
+            context=_report_context(report),
+            error=post_run_error,
+        )
+
+        return report
+    finally:
+        manager.stop()
 
 
 def _recover_last_context(context_file: str) -> tuple[dict[str, object], str]:

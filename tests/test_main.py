@@ -731,6 +731,89 @@ def test_run_on_failure_context_falls_back_to_empty_dict_with_no_context_file(tm
     assert json.loads(out.read_text()) == {}
 
 
+def test_run_locks_only_a_database_that_actually_needs_a_fix(
+    pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path
+) -> None:
+    """A clean database's pre-existing connection must never be touched
+    -- proves lock() is never called for a database with nothing to
+    fix, via real connection survival, not internal state."""
+    host, port = _host_port(pg_dsn)
+    clean_name = "cg_main_test_lockdown_clean"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{clean_name}"')
+    admin_conn.execute(f'CREATE DATABASE "{clean_name}"')
+    try:
+        clean_conn = psycopg.connect(
+            f"host={host} port={port} dbname={clean_name}", prepare_threshold=None
+        )
+        try:
+            main.run(
+                host,
+                port,
+                glibc_locales_path="/nix/store/test-glibc-locales",
+                partition_repair_enabled=True,
+                max_repair_attempts=10,
+                lockdown_path=str(lockdown_conf_path),
+            )
+            # never terminated: the clean database was never locked
+            assert clean_conn.execute("SELECT 1").fetchone() == (1,)
+        finally:
+            clean_conn.close()
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{clean_name}"')
+
+
+def test_run_locks_and_unlocks_a_database_that_needs_a_fix(
+    pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path
+) -> None:
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_lockdown_needs_fix"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(
+        f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
+        f"TEMPLATE template0"
+    )
+    try:
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name}", prepare_threshold=None
+        ) as conn:
+            conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, label text)")
+            conn.execute("INSERT INTO widgets (label) VALUES ('a'), ('b')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+                "WHERE datname = current_database()"
+            )
+            conn.commit()
+
+        untagged = psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None)
+        try:
+            main.run(
+                host,
+                port,
+                glibc_locales_path="/nix/store/test-glibc-locales",
+                partition_repair_enabled=True,
+                max_repair_attempts=10,
+                lockdown_path=str(lockdown_conf_path),
+            )
+
+            # terminated at some point during the run (locked, since a
+            # fix was genuinely needed), and immediately reconnectable
+            # again once the run (and this database's own unlock)
+            # finished
+            with pytest.raises(psycopg.OperationalError):
+                untagged.execute("SELECT 1")
+            with psycopg.connect(
+                f"host={host} port={port} dbname={name}", prepare_threshold=None
+            ):
+                pass
+        finally:
+            # already terminated server-side in the real (green) case
+            # -- closing a dead connection is a safe no-op
+            untagged.close()
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
 def test_run_on_failure_cleans_up_an_active_lockdown_file(
     pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path, tmp_path
 ) -> None:
