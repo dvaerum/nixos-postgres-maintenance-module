@@ -11,7 +11,7 @@ from collections.abc import Iterator
 import psycopg
 import pytest
 
-from collation_guard.partitions import partition_repair_candidates
+from collation_guard.partitions import misplaced_rows, partition_repair_candidates, repair_row
 
 
 @pytest.fixture
@@ -53,3 +53,96 @@ def test_partition_repair_candidates_is_empty_with_no_partitioned_tables(
     test_db: psycopg.Connection,
 ) -> None:
     assert partition_repair_candidates(test_db) == []
+
+
+# NOTE: there is no legitimate SQL/tool-level way to get a
+# constraint-violating row into an already-attached partition on a
+# single real Postgres instance -- confirmed the hard way (see
+# docs/learnings/partition-repair-testing.md): ATTACH PARTITION always
+# re-scans and rejects, a matching `NOT VALID` CHECK constraint does
+# NOT skip that scan (that trick only avoids double-scanning when
+# paired with an explicit prior `VALIDATE CONSTRAINT`, which itself
+# would reject a genuinely bad row -- there's no bypass, by design),
+# and pg_surgery (the real contrib tool for forcing corrupt data into a
+# heap) only ships heap_force_freeze/heap_force_kill, not a force
+# insert. A truly misplaced row only exists in reality because the
+# *same* collation's comparison behavior changed between validation
+# time and now (an actual glibc/ICU version change) -- not reproducible
+# in a single-locale sandbox. So cycle 7 proves its two load-bearing
+# halves separately instead of one end-to-end fake-drift reproduction:
+# detection against a clean partition, and the row-movement mechanism
+# repair_row() depends on, proven with a real value change.
+#
+# That same probing also caught a real design bug: an UPDATE issued
+# directly against the CHILD relation does not get cross-partition
+# routing at all -- it just re-checks that child's own bound and
+# rejects the row outright. Routing only happens when the UPDATE goes
+# through the top-level partitioned (root) table, identifying the
+# physical row via tableoid + ctid. repair_row() takes root_table for
+# exactly this reason.
+
+
+@pytest.fixture
+def partitioned_db(test_db: psycopg.Connection) -> psycopg.Connection:
+    conn = test_db
+    conn.execute("CREATE TABLE parent (id serial, k text) PARTITION BY RANGE (k)")
+    conn.execute("CREATE TABLE child_a PARTITION OF parent FOR VALUES FROM (MINVALUE) TO ('m')")
+    conn.execute("CREATE TABLE child_b PARTITION OF parent FOR VALUES FROM ('m') TO (MAXVALUE)")
+    conn.execute("INSERT INTO parent (k) VALUES ('apple')")
+    conn.commit()
+    return conn
+
+
+def test_misplaced_rows_is_empty_for_a_correctly_placed_row(
+    partitioned_db: psycopg.Connection,
+) -> None:
+    assert misplaced_rows(partitioned_db, "public", "child_a") == []
+
+
+def test_repair_row_is_a_noop_for_an_already_correct_row(
+    partitioned_db: psycopg.Connection,
+) -> None:
+    conn = partitioned_db
+    (ctid,) = conn.execute("SELECT ctid FROM child_a WHERE k = 'apple'").fetchone()
+
+    repair_row(conn, "public", "parent", "child_a", ["k"], ctid)
+    conn.commit()
+
+    row = conn.execute("SELECT k FROM child_a WHERE k = 'apple'").fetchone()
+    assert row is not None
+
+
+def test_cross_partition_update_through_root_moves_a_row_to_its_correct_partition(
+    partitioned_db: psycopg.Connection,
+) -> None:
+    """Proves the mechanism repair_row() depends on: an UPDATE issued
+    through the top-level ROOT table (identifying the physical row via
+    tableoid + ctid, exactly as repair_row() does) triggers Postgres's
+    cross-partition UPDATE row movement (PG11+) when the new value no
+    longer satisfies the row's current partition. This was the key
+    uncertain assumption in repair_row()'s design -- confirmed here
+    with a real value change, since an actual stale-comparison scenario
+    (same value, different collation behavior) can't be constructed in
+    a single-locale sandbox (see the NOTE above)."""
+    conn = partitioned_db
+    (ctid,) = conn.execute("SELECT ctid FROM child_a WHERE k = 'apple'").fetchone()
+
+    conn.execute("ALTER TABLE child_a DISABLE TRIGGER USER")
+    try:
+        conn.execute(
+            "UPDATE parent SET k = 'zebra' WHERE tableoid = 'child_a'::regclass AND ctid = %s::tid",
+            (ctid,),
+        )
+    finally:
+        conn.execute("ALTER TABLE child_a ENABLE TRIGGER USER")
+    conn.commit()
+
+    # Still reachable through the parent -- nothing was lost.
+    row = conn.execute("SELECT k FROM parent WHERE k = 'zebra'").fetchone()
+    assert row is not None
+
+    # And it physically moved to the partition that actually matches it.
+    in_a = conn.execute("SELECT k FROM child_a WHERE k = 'zebra'").fetchone()
+    in_b = conn.execute("SELECT k FROM child_b WHERE k = 'zebra'").fetchone()
+    assert in_a is None
+    assert in_b is not None

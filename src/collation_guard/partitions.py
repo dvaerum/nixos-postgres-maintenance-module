@@ -16,6 +16,78 @@ no "drift" to detect for them in the first place.
 from __future__ import annotations
 
 import psycopg
+from psycopg import sql
+
+
+def misplaced_rows(conn: psycopg.Connection, schema: str, child: str) -> list[object]:
+    """ctid of every row in `child` that no longer satisfies its own
+    partition bound constraint, checked directly against
+    `pg_get_partition_constraintdef()` -- not by provoking Postgres's
+    own ATTACH-validation error and parsing it. Confirmed against
+    PG16's tablecmds.c: that error ("partition constraint of relation
+    ... is violated by some row") names only the table, never the row
+    -- there is no DETAIL with row values to key a fix off of.
+    """
+    row = conn.execute(
+        "SELECT pg_get_partition_constraintdef(%s::regclass)",
+        (f"{schema}.{child}",),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return []
+    constraint = row[0]
+    rows = conn.execute(
+        sql.SQL("SELECT ctid FROM {}.{} WHERE NOT ({})").format(
+            sql.Identifier(schema), sql.Identifier(child), sql.SQL(constraint)
+        )
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def repair_row(
+    conn: psycopg.Connection,
+    schema: str,
+    root_table: str,
+    child: str,
+    key_columns: list[str],
+    ctid: object,
+) -> None:
+    """Force Postgres's own cross-partition UPDATE row movement (PG11+)
+    to relocate one misplaced row to wherever it actually belongs under
+    the current collation: an UPDATE of a partition key column to its
+    own unchanged value still re-evaluates the row against every
+    sibling partition's bounds, and moves it (DELETE + INSERT under the
+    hood) if its current partition no longer matches.
+
+    Must be issued against `root_table` (the top-level partitioned
+    table), identifying the physical row via `tableoid` + `ctid` --
+    confirmed empirically that an UPDATE issued directly against the
+    child relation does NOT get cross-partition routing at all; it only
+    re-checks that child's own bound and rejects the row outright if it
+    fails, never considering siblings (see
+    docs/learnings/partition-repair-testing.md).
+
+    DISABLE/ENABLE TRIGGER USER brackets this so that internal
+    DELETE+INSERT doesn't fire user-defined triggers as a side effect
+    of what is, from the application's point of view, a no-op write --
+    USER (not ALL) deliberately leaves FK/constraint-enforcement
+    triggers active throughout (see docs/decisions/0004, and the real
+    bug this distinction avoids: BUG #18516, where DISABLE TRIGGER ALL
+    silently dropped FK enforcement with no re-validation on re-enable).
+    """
+    child_table = sql.Identifier(schema, child)
+    set_clause = sql.SQL(", ").join(
+        sql.SQL("{0} = {0}").format(sql.Identifier(c)) for c in key_columns
+    )
+    conn.execute(sql.SQL("ALTER TABLE {} DISABLE TRIGGER USER").format(child_table))
+    try:
+        conn.execute(
+            sql.SQL("UPDATE {} SET {} WHERE tableoid = %s::regclass AND ctid = %s::tid").format(
+                sql.Identifier(schema, root_table), set_clause
+            ),
+            (f"{schema}.{child}", ctid),
+        )
+    finally:
+        conn.execute(sql.SQL("ALTER TABLE {} ENABLE TRIGGER USER").format(child_table))
 
 
 def partition_repair_candidates(conn: psycopg.Connection) -> list[tuple[str, str]]:
