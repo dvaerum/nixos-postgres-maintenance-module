@@ -632,7 +632,16 @@ def test_run_per_database_success_context_lists_reindexed_relations(
         f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
         f"TEMPLATE template0"
     )
-    out = tmp_path / "context.json"
+    # Every database's per-database onSuccess hook fires in this run
+    # (none of them fail), concurrently across worker threads -- write
+    # one file per database (named from COLLATION_GUARD_DATABASE) so
+    # concurrent hook subprocesses never race on the same path.
+    script = (
+        "import os; "
+        "open(os.path.join(os.environ['OUT_DIR'], os.environ['COLLATION_GUARD_DATABASE']), 'w')"
+        ".write(os.environ['COLLATION_GUARD_CONTEXT'])"
+    )
+    hook = Hook(path=sys.executable, args=["-c", script], environment={"OUT_DIR": str(tmp_path)})
     try:
         with psycopg.connect(
             f"host={host} port={port} dbname={name}", prepare_threshold=None
@@ -651,13 +660,11 @@ def test_run_per_database_success_context_lists_reindexed_relations(
             glibc_locales_path="/nix/store/test-glibc-locales",
             partition_repair_enabled=True,
             max_repair_attempts=10,
-            hooks=HooksConfig(per_database=PerDatabaseHooks(on_success=[_context_dump_hook(out)])),
+            hooks=HooksConfig(per_database=PerDatabaseHooks(on_success=[hook])),
         )
 
-        contexts = []
-        if out.exists():
-            contexts.append(json.loads(out.read_text()))
-        assert any(c.get("reindexed") == ["widgets"] for c in contexts)
+        context = json.loads((tmp_path / name).read_text())
+        assert context == {"reindexed": ["widgets"]}
     finally:
         admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
