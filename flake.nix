@@ -2,7 +2,7 @@
   description = "NixOS module + CLI that closes nixpkgs#318777: reindex/refresh a Postgres cluster whose collation library version drifted, and repair text-partition bounds after a collation change, before postgresql.target ever comes up.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     utils.url = "github:numtide/flake-utils";
   };
 
