@@ -1,0 +1,41 @@
+name: Update flake inputs
+
+on:
+  schedule:
+    # Sunday 03:00 UTC -- nixpkgs is the only meaningful input (the
+    # other, flake-utils, is unmodified upstream boilerplate swept up
+    # by the same `nix flake update` anyway).
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: nix flake update
+        run: nix flake update
+
+      - name: nix flake check
+        run: nix flake check -L
+
+      - name: Commit and push if flake.lock changed
+        run: |
+          if git diff --quiet -- flake.lock; then
+            echo "flake.lock unchanged, nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add flake.lock
+          git commit -m "bump flake inputs"
+          git push
