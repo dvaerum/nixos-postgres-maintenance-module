@@ -87,6 +87,38 @@ def test_process_database_reindexes_and_refreshes_on_mismatch(pg_dsn: str, test_
         assert not database_collation_is_stale(conn)
 
 
+def test_process_database_reindex_skips_partitioned_parent(pg_dsn: str, test_db: str) -> None:
+    """A partitioned table's own (relkind 'p') entry must not be handed
+    to REINDEX TABLE directly -- it holds no physical storage of its
+    own (only its leaf partitions, already reindexed separately, do),
+    and REINDEXing it directly raises a real, confirmed Postgres error
+    ("REINDEX TABLE cannot run inside a transaction block") that this
+    project's per-relation transaction wrapping can never satisfy.
+    Found building the ICU-drift test (docs/decisions/0008): any
+    cluster with a partitioned table and a stale collation hit this
+    unconditionally, independent of ICU."""
+    with _connect(pg_dsn, test_db) as conn:
+        conn.execute("CREATE TABLE events (k text, id int) PARTITION BY RANGE (k)")
+        conn.execute(
+            "CREATE TABLE events_p1 PARTITION OF events FOR VALUES FROM (MINVALUE) TO ('m')"
+        )
+        conn.execute(
+            "CREATE TABLE events_p2 PARTITION OF events FOR VALUES FROM ('m') TO (MAXVALUE)"
+        )
+        conn.execute("INSERT INTO events (k, id) VALUES ('alpha', 1), ('zebra', 2)")
+        conn.commit()
+
+        _fake_stale(conn, test_db)
+        conn.commit()
+
+        result = process_database(conn)
+
+        assert result.ok, f"expected a clean run, got failures: {result.failed}"
+        assert "events" not in result.reindexed
+        assert set(result.reindexed) == {"events_p1", "events_p2"}
+        assert result.failed == []
+
+
 def test_process_database_is_idempotent_after_refresh(pg_dsn: str, test_db: str) -> None:
     with _connect(pg_dsn, test_db) as conn:
         conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text)")

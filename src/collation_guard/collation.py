@@ -70,13 +70,28 @@ def user_tables(conn: psycopg.Connection) -> list[tuple[str, str]]:
     """(schema, table) for every ordinary user table -- excludes the
     system catalogs, which `REINDEX DATABASE` itself also never touches
     (confirmed in the PG16 REINDEX docs: "Recreate all indexes within
-    the current database, except system catalogs")."""
+    the current database, except system catalogs"), and excludes a
+    partitioned table's own entry (relkind 'p', at any partitioning
+    depth): it holds no physical storage or indexes of its own -- only
+    its leaf partitions (relkind 'r', already included here) do -- and
+    `REINDEX TABLE` on a partitioned table parent needs multiple
+    internal transactions, which fails outright inside this project's
+    per-relation transaction ("REINDEX TABLE cannot run inside a
+    transaction block"). Confirmed empirically building the ICU-drift
+    test (docs/decisions/0008): this hit unconditionally for any
+    partitioned table caught up in a stale-collation reindex, unrelated
+    to ICU specifically. `pg_tables` can't be used here any more since
+    its own definition includes relkind 'p' rows with no relkind column
+    exposed to filter them back out, hence the join against pg_class
+    directly."""
     rows = conn.execute(
         """
-        SELECT schemaname, tablename
-        FROM pg_tables
-        WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-        ORDER BY schemaname, tablename
+        SELECT n.nspname, c.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'r'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY n.nspname, c.relname
         """
     ).fetchall()
     return [(str(r[0]), str(r[1])) for r in rows]
