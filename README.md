@@ -37,7 +37,7 @@ flowchart TD
     C -- yes --> D[refresh template0's version<br/>no user objects, refresh-only]
     C -- no --> E
     D --> E{glibc stamp stale<br/>or missing?}
-    E -- yes --> F[reindex every C.* database<br/>per relation, independently]
+    E -- yes --> F["for each C.* database:<br/>lock -> reindex (per relation) -> unlock"]
     F --> G{all reindexed cleanly?}
     G -- yes --> H[advance the stamp]
     G -- no --> X
@@ -46,11 +46,14 @@ flowchart TD
 
     subgraph perdb["per-database worker"]
         DPRE[perDatabase.preStart hook] -->|blockOnFailure fails| SKIP[skip this database]
-        DPRE --> J{Postgres-tracked<br/>mismatch?}
+        DPRE --> NEEDLOCK{needs a fix?}
+        NEEDLOCK -- no --> DOK
+        NEEDLOCK -- yes --> LOCK[lock this database]
+        LOCK --> J{Postgres-tracked<br/>mismatch?}
         J -- yes --> K[reindex every user table<br/>per relation, independently]
         K --> L{all reindexed cleanly?}
         L -- yes --> M[refresh database +<br/>named collation versions]
-        L -- no --> DFAIL
+        L -- no --> UNLOCK2[unlock] --> DFAIL
         M --> N
         J -- no --> N{partition repair<br/>enabled?}
         N -- yes --> O[find candidate partitioned tables<br/>non-C/POSIX collated key]
@@ -58,10 +61,10 @@ flowchart TD
         P --> Q{rows found?}
         Q -- yes --> R[cross-partition UPDATE via root table<br/>DISABLE/ENABLE TRIGGER USER]
         R --> SCAP{clean, or<br/>safety cap hit?}
-        SCAP -- clean --> DOK[perDatabase.onSuccess hook]
-        SCAP -- capped --> DFAIL[perDatabase.onFailure hook]
-        Q -- no --> DOK
-        N -- no --> DOK
+        SCAP -- clean --> UNLOCK1[unlock] --> DOK[perDatabase.onSuccess hook]
+        SCAP -- capped --> UNLOCK3[unlock] --> DFAIL[perDatabase.onFailure hook]
+        Q -- no --> UNLOCK1
+        N -- no --> UNLOCK1
     end
 
     I --> perdb
@@ -74,7 +77,7 @@ flowchart TD
     U -- 0 --> V[postgresql-setup.service]
     V --> W[postgresql.target]
     U -- 1 --> X
-    X -.OnFailure=.-> OF["collation-guard --on-failure<br/>(separate process, runs even on crash)"]
+    X -.OnFailure=.-> OF["collation-guard --on-failure<br/>(separate process, runs even on crash)<br/>also cleans up a lockdown file left<br/>behind by a crash mid-lock"]
     OF --> ONFAIL[onFailure hooks]
     X -.blocks.-> V
 ```
@@ -95,6 +98,17 @@ the work is I/O-bound (waiting on Postgres over a socket), so this cuts
 boot time on a multi-database cluster without needing to raise it
 further; see `docs/decisions/0006-hooks-and-parallel-per-database-processing.md`
 for why it's bounded rather than unbounded.
+
+Postgres itself is already accepting connections by the time this
+guard runs (`postgresql.service` is `Type=notify`, and only reports
+ready once it's listening) — anything not ordered after
+`postgresql-setup.service`/`postgresql.target` could otherwise connect
+mid-REINDEX or mid-repair, against inconsistent state. By default
+(`services.postgresqlCollationGuard.connectionLockdown.enable = true`),
+each database is rejected for new connections — and has any
+already-open session terminated — for exactly the duration it's
+actively being worked on, and only if it actually needs a fix; see
+`docs/decisions/0007-connection-lockdown-during-repair.md`.
 
 ## Usage
 
@@ -129,13 +143,16 @@ services.postgresqlCollationGuard.hooks.perDatabase.onFailure = [
 ];
 ```
 
-Every hook gets `COLLATION_GUARD_STAGE` and, where relevant,
-`COLLATION_GUARD_DATABASE`/`COLLATION_GUARD_CONTEXT` (JSON)/
-`COLLATION_GUARD_ERROR` (a plain one-line summary, no JSON parsing
-needed, on failure-shaped stages). `environmentFile` and inline
-`environment` merge with those -- any variable name defined by more
-than one source is a hard error (`EnvironmentCollisionError`) before
-the hook ever runs, never a silent override.
+Every hook gets `COLLATION_GUARD_STAGE` (always), `COLLATION_GUARD_DATABASE`
+(the four `database_*` stages), `COLLATION_GUARD_ERROR` (a plain
+one-line summary, no JSON parsing needed, on failure-shaped stages),
+and `COLLATION_GUARD_CONTEXT` — always present, always valid JSON, on
+every single stage (an empty `{}` where there's nothing yet to report,
+e.g. `preStart`) — no need to check whether it exists before parsing
+it. `environmentFile` and inline `environment` merge with those -- any
+variable name defined by more than one source is a hard error
+(`EnvironmentCollisionError`) before the hook ever runs, never a silent
+override.
 
 `blockOnFailure` always does something real and specific to that hook
 point (abort the run, skip one database, add a failure that can flip
@@ -147,6 +164,19 @@ for the full table. `onFailure` is triggered by systemd's `OnFailure=`
 crashing outright), but the hooks themselves run through the exact
 same mechanism as every other stage, from a second `collation-guard
 --on-failure` entry point into the same binary.
+
+### Connection lockdown
+
+```nix
+services.postgresqlCollationGuard.connectionLockdown.enable = false; # default true
+```
+
+Default `true`: closes the gap above by rejecting new connections to a
+database (and terminating any already-open session) for exactly the
+duration it's actively being reindexed/repaired, and only if it
+actually needs a fix — a database with nothing to fix is never locked.
+Turn it off only if there's a specific reason to allow concurrent
+connections during the guard's run.
 
 ### CLI
 
@@ -183,21 +213,6 @@ collation-guard --dry-run # list partition-repair candidates across the cluster,
 
 See `docs/decisions/` for the full reasoning behind each piece, and
 `docs/learnings/` for other non-obvious findings from building this.
-
-## Future work
-
-- **Blocking external (non-systemd-managed) clients during the run.**
-  `postgresql-setup.service`/`postgresql.target` and anything ordered
-  after them on *this* host correctly wait for the guard, but a client
-  connecting from somewhere else entirely -- another host on the
-  network, anything outside this host's own systemd dependency graph --
-  has no reason to wait and can connect while the guard is still
-  reindexing or mid-repair, against inconsistent state. Not designed or
-  implemented yet; no clear mechanism chosen (candidates to look into:
-  temporarily tightening `pg_hba.conf`, a connection-limiting setting,
-  or some way to advertise "still under maintenance" that external
-  tooling could check) -- flagged here as a real gap worth solving, not
-  solved.
 
 ## Development
 
