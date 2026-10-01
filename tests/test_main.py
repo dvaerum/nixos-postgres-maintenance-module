@@ -839,6 +839,59 @@ def test_run_glibc_stamp_phase_locks_postgres_itself_without_self_harm(
     assert "postgres" in report.databases_processed
 
 
+def test_run_connection_lockdown_disabled_is_a_true_no_op(
+    pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path
+) -> None:
+    """connectionLockdown.enable = false: even with a real
+    lockdown_path configured (as the Nix module always would), and a
+    database that genuinely needs a fix, NullLockdownManager must be a
+    true no-op -- no file ever written, no pg_terminate_backend call,
+    not just "disabled but still probed." Proven the same way as the
+    other lockdown behaviors: via a real, untagged connection that must
+    survive untouched throughout."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_lockdown_disabled"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(
+        f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
+        f"TEMPLATE template0"
+    )
+    try:
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name}", prepare_threshold=None
+        ) as conn:
+            conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, label text)")
+            conn.execute("INSERT INTO widgets (label) VALUES ('a'), ('b')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+                "WHERE datname = current_database()"
+            )
+            conn.commit()
+
+        untagged = psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None)
+        try:
+            report = main.run(
+                host,
+                port,
+                glibc_locales_path="/nix/store/test-glibc-locales",
+                partition_repair_enabled=True,
+                max_repair_attempts=10,
+                lockdown_path=str(lockdown_conf_path),
+                connection_lockdown_enabled=False,
+            )
+
+            assert report.success
+            assert name in report.databases_repaired
+            assert not lockdown_conf_path.exists()
+            # never terminated -- the lock was never actually requested
+            assert untagged.execute("SELECT 1").fetchone() == (1,)
+        finally:
+            untagged.close()
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
 def test_run_on_failure_cleans_up_an_active_lockdown_file(
     pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path, tmp_path
 ) -> None:

@@ -309,12 +309,13 @@ def run(
     max_parallel_databases: int = 4,
     dry_run: bool = False,
     lockdown_path: str | None = None,
+    connection_lockdown_enabled: bool = True,
 ) -> RunReport:
     report = RunReport()
     hooks = hooks or HooksConfig()
     manager: lockdown.LockdownManager | lockdown.NullLockdownManager = (
         lockdown.LockdownManager(host, port, lockdown_path)
-        if lockdown_path is not None
+        if lockdown_path is not None and connection_lockdown_enabled
         else lockdown.NullLockdownManager()
     )
 
@@ -493,6 +494,10 @@ def main() -> int:
         max_repair_attempts=int(os.environ["COLLATION_GUARD_MAX_REPAIR_ATTEMPTS"]),
         hooks=hooks,
         dry_run=args.dry_run,
+        lockdown_path=os.environ.get("COLLATION_GUARD_LOCKDOWN_FILE"),
+        connection_lockdown_enabled=(
+            os.environ.get("COLLATION_GUARD_CONNECTION_LOCKDOWN_ENABLE", "true") == "true"
+        ),
     )
 
     if args.dry_run:
