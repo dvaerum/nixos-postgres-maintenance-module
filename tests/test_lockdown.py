@@ -14,7 +14,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from collation_guard.lockdown import LockdownManager
+from collation_guard.lockdown import LockdownManager, _LockRequest
 
 
 def _host_port(pg_dsn: str) -> tuple[str, str]:
@@ -76,6 +76,36 @@ def test_lock_two_databases_unlock_one_leaves_the_other_locked(
         for name in (name_a, name_b):
             admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
         admin_conn.execute("DROP ROLE IF EXISTS cg_lockdown_test_role2")
+
+
+def test_stop_drains_in_flight_requests_before_closing(
+    manager: LockdownManager,
+    pg_dsn: str,
+    admin_conn: psycopg.Connection,
+    lockdown_conf_path: Path,
+) -> None:
+    """Queues several requests directly (bypassing the blocking public
+    lock()/unlock() API, which can't itself leave anything "in flight")
+    and calls stop() immediately -- proves every request already
+    queued ahead of stop()'s own sentinel is fully applied, and the
+    thread has actually exited, before stop() returns."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_lockdown_test_stop_drain"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(f'CREATE DATABASE "{name}"')
+    requests = [_LockRequest(name, "lock") for _ in range(3)]
+    try:
+        for request in requests:
+            manager._queue.put(request)
+        manager.stop()
+
+        assert all(request.done.is_set() for request in requests)
+        assert not manager._thread.is_alive()
+        assert not _can_connect(host, port, name)
+    finally:
+        lockdown_conf_path.unlink(missing_ok=True)
+        admin_conn.execute("SELECT pg_reload_conf()")
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
 
 def test_concurrent_lock_unlock_from_multiple_threads_is_race_free(
