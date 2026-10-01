@@ -523,3 +523,74 @@ def test_run_on_failure_blocking_hook_failure_makes_the_process_exit_nonzero(tmp
     exit_code = main.run_on_failure(hooks_file, str(context_file))
 
     assert exit_code == 1
+
+
+def test_run_processes_many_databases_correctly_under_real_concurrency(
+    pg_dsn: str, admin_conn: psycopg.Connection
+) -> None:
+    """More databases than worker threads, forcing real queuing, with
+    a mix of clean and genuinely-failing databases -- proves one
+    database's failure doesn't block or corrupt another's result, and
+    the merged report is complete and deterministically sorted
+    regardless of which thread actually finished first."""
+    host, port = _host_port(pg_dsn)
+    clean_names = [f"cg_parallel_clean_{i}" for i in range(4)]
+    broken_name = "cg_parallel_broken"
+    all_names = [*clean_names, broken_name]
+
+    for name in all_names:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    try:
+        for name in clean_names:
+            admin_conn.execute(f'CREATE DATABASE "{name}"')
+
+        admin_conn.execute(
+            f'CREATE DATABASE "{broken_name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
+            f"TEMPLATE template0"
+        )
+        with psycopg.connect(
+            f"host={host} port={port} dbname={broken_name}", prepare_threshold=None
+        ) as conn:
+            conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text UNIQUE)")
+            conn.execute("INSERT INTO widgets (name) VALUES ('alpha')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_index SET indisready = false "
+                "WHERE indexrelid = 'widgets_name_key'::regclass"
+            )
+            conn.commit()
+            conn.execute("INSERT INTO widgets (name) VALUES ('alpha')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_index SET indisready = true "
+                "WHERE indexrelid = 'widgets_name_key'::regclass"
+            )
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+                "WHERE datname = current_database()"
+            )
+            conn.commit()
+
+        report = main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-locales",
+            partition_repair_enabled=True,
+            max_repair_attempts=10,
+            max_parallel_databases=2,  # fewer workers than databases below
+        )
+
+        for name in [*all_names, "postgres", "template1"]:
+            assert name in report.databases_processed
+
+        assert report.databases_processed == sorted(report.databases_processed)
+        assert report.databases_repaired == sorted(report.databases_repaired)
+
+        broken_failures = [f for f in report.failures if f.database == broken_name]
+        assert len(broken_failures) == 1
+        for name in clean_names:
+            assert not any(f.database == name for f in report.failures)
+    finally:
+        for name in all_names:
+            admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')

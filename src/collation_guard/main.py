@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 
 import psycopg
@@ -90,15 +91,22 @@ def _process_database(
     partition_repair_enabled: bool,
     max_attempts: int,
     hooks: HooksConfig,
-    report: RunReport,
-) -> None:
+) -> RunReport:
+    """Processes one database in complete isolation, returning its own
+    RunReport rather than mutating a shared one -- lets run() call this
+    from multiple threads (one per database) with no locking: each
+    worker only ever touches its own report, and run() merges every
+    worker's result into the real report sequentially, back in the
+    main thread, once every worker has finished."""
+    report = RunReport()
+
     if not _run_hooks(
         hooks.per_database.pre_start, "database_pre_start", report, database=dbname
     ):
         # blockOnFailure=true: skip this database entirely -- no
         # process_database, no partition repair, not added to
         # databases_processed. Other databases are unaffected.
-        return
+        return report
 
     failures_before = len(report.failures)
 
@@ -140,6 +148,8 @@ def _process_database(
             database=dbname,
             error=error,
         )
+
+    return report
 
 
 def _process_glibc_stamp(host: str, port: str, glibc_locales_path: str, report: RunReport) -> None:
@@ -227,6 +237,7 @@ def run(
     partition_repair_enabled: bool,
     max_repair_attempts: int,
     hooks: HooksConfig | None = None,
+    max_parallel_databases: int = 4,
     dry_run: bool = False,
 ) -> RunReport:
     report = RunReport()
@@ -253,10 +264,32 @@ def run(
 
     _process_glibc_stamp(host, port, glibc_locales_path, report)
 
-    for dbname in databases:
-        _process_database(
-            host, port, dbname, partition_repair_enabled, max_repair_attempts, hooks, report
-        )
+    # Each worker gets its own psycopg.Connection and its own RunReport
+    # (see _process_database's docstring) -- no shared mutable state
+    # between threads, so no locking needed. Submitted in sorted order
+    # and merged in sorted order too, so the final report is
+    # deterministic regardless of which thread actually finishes first.
+    with ThreadPoolExecutor(max_workers=max_parallel_databases) as executor:
+        futures = [
+            executor.submit(
+                _process_database,
+                host,
+                port,
+                dbname,
+                partition_repair_enabled,
+                max_repair_attempts,
+                hooks,
+            )
+            for dbname in sorted(databases)
+        ]
+        for future in futures:
+            sub_report = future.result()
+            report.databases_processed.extend(sub_report.databases_processed)
+            report.databases_repaired.extend(sub_report.databases_repaired)
+            report.failures.extend(sub_report.failures)
+
+    report.databases_processed.sort()
+    report.databases_repaired.sort()
 
     if report.success:
         _run_hooks(hooks.on_success, "on_success", report)
