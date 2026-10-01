@@ -11,7 +11,12 @@ from collections.abc import Iterator
 import psycopg
 import pytest
 
-from collation_guard.partitions import misplaced_rows, partition_repair_candidates, repair_row
+from collation_guard.partitions import (
+    has_rule,
+    misplaced_rows,
+    partition_repair_candidates,
+    repair_row,
+)
 
 
 @pytest.fixture
@@ -223,3 +228,15 @@ def test_repair_row_does_not_needlessly_cascade_an_unchanged_foreign_key(
     row = conn.execute("SELECT xmin FROM referencing WHERE parent_k = 'apple'").fetchone()
     assert row is not None
     assert row[0] == xmin_before
+
+
+def test_has_rule_detects_a_rule_on_the_table(partitioned_db: psycopg.Connection) -> None:
+    conn = partitioned_db
+    assert has_rule(conn, "public", "child_a") is False
+
+    conn.execute("CREATE RULE no_op_insert AS ON INSERT TO child_a DO INSTEAD NOTHING")
+    conn.commit()
+
+    assert has_rule(conn, "public", "child_a") is True
+    # A sibling with no rule of its own must not be affected.
+    assert has_rule(conn, "public", "child_b") is False

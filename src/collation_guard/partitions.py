@@ -19,6 +19,26 @@ import psycopg
 from psycopg import sql
 
 
+def has_rule(conn: psycopg.Connection, schema: str, table: str) -> bool:
+    """True if `table` has any user-defined RULE (pg_rewrite) attached.
+    Postgres has no DISABLE RULE equivalent to DISABLE TRIGGER USER --
+    there's no way to wrap a repair so a rule's side effects stay
+    suppressed the way repair_row() suppresses triggers. The guard
+    skips a ruled relation entirely (log it, let a human decide) rather
+    than risk firing arbitrary rule actions during an internal
+    maintenance write. True legacy rule-based manual partitioning can't
+    appear here at all -- it's a structurally different, mutually
+    exclusive mechanism from declarative pg_partitioned_table
+    partitioning -- so in practice this only catches a genuinely
+    unusual custom rule someone added to a partition child directly.
+    """
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_rewrite WHERE ev_class = %s::regclass)",
+        (f"{schema}.{table}",),
+    ).fetchone()
+    return bool(row is not None and row[0])
+
+
 def misplaced_rows(conn: psycopg.Connection, schema: str, child: str) -> list[object]:
     """ctid of every row in `child` that no longer satisfies its own
     partition bound constraint, checked directly against
