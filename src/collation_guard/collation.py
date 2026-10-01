@@ -14,7 +14,9 @@ calling `REINDEX DATABASE` once.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 
 import psycopg
 from psycopg import sql
@@ -28,10 +30,11 @@ class DatabaseResult:
 
     reindexed: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    refresh_error: str | None = None
 
     @property
     def ok(self) -> bool:
-        return not self.failed
+        return not self.failed and self.refresh_error is None
 
 
 def database_collation_is_stale(conn: psycopg.Connection) -> bool:
@@ -94,6 +97,55 @@ def refresh_named_collation_version(conn: psycopg.Connection, collation: str) ->
     conn.execute(sql.SQL("ALTER COLLATION {} REFRESH VERSION").format(sql.Identifier(collation)))
 
 
+def template0_collation_is_stale(conn: psycopg.Connection) -> bool:
+    """`template0` disallows direct connections (`datallowconn = false`),
+    but its recorded collation version can still be read from any other
+    connection in the same cluster -- `pg_database` is a shared catalog,
+    not per-database."""
+    row = conn.execute(
+        """
+        SELECT datcollversion IS NOT NULL
+           AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)
+        FROM pg_database
+        WHERE datname = 'template0'
+        """
+    ).fetchone()
+    return bool(row is not None and row[0])
+
+
+def refresh_template0(conn: psycopg.Connection) -> None:
+    """`template0` carries no user objects, so there's nothing to
+    reindex -- just refresh its recorded version. `ALTER DATABASE`
+    has no same-database restriction (confirmed against PG16's
+    `AlterDatabaseRefreshColl()` source), so this can run from any
+    connection in the cluster, same as the stale-check above."""
+    refresh_database_collation_version(conn, "template0")
+
+
+def _safe_refresh(
+    conn: psycopg.Connection, description: str, refresh: Callable[[], None]
+) -> str | None:
+    """Run a REFRESH COLLATION VERSION call, catching the one
+    documented failure mode: Postgres rejects any refresh where the
+    recorded and actual versions disagree on NULL-ness ("invalid
+    collation version change", confirmed in PG16's
+    `dbcommands.c:AlterDatabaseRefreshColl()` -- `elog(ERROR, ...)` when
+    exactly one of old/new version is NULL). Low probability in
+    practice (would need a foreign-provider version string, or a
+    locale/provider actually changing out from under a database), but
+    cheap to handle defensively rather than assume success. Returns an
+    error message on failure, None on success."""
+    try:
+        refresh()
+    except psycopg.Error as exc:
+        logger.error("REFRESH COLLATION VERSION failed for %s: %s", description, exc)
+        conn.rollback()
+        return str(exc)
+    else:
+        conn.commit()
+        return None
+
+
 def process_database(conn: psycopg.Connection) -> DatabaseResult:
     """Check and repair the connection's current database.
 
@@ -131,10 +183,33 @@ def process_database(conn: psycopg.Connection) -> DatabaseResult:
             reindexed.append(table)
 
     if not failed:
+        refresh_error: str | None = None
         if database_collation_is_stale(conn):
-            refresh_database_collation_version(conn, conn.info.dbname)
+            dbname = conn.info.dbname
+            refresh_error = _safe_refresh(
+                conn,
+                f"database {dbname}",
+                partial(refresh_database_collation_version, conn, dbname),
+            )
         for name in stale_collations:
-            refresh_named_collation_version(conn, name)
-        conn.commit()
+            if refresh_error is not None:
+                break
+            refresh_error = _safe_refresh(
+                conn,
+                f"collation {name}",
+                partial(refresh_named_collation_version, conn, name),
+            )
+        return DatabaseResult(reindexed=reindexed, failed=failed, refresh_error=refresh_error)
 
     return DatabaseResult(reindexed=reindexed, failed=failed)
+
+
+def process_template0(conn: psycopg.Connection) -> str | None:
+    """Refresh `template0`'s recorded collation version if stale.
+    `template0` carries no user objects, so there's nothing to
+    reindex -- this is refresh-only. Returns an error message if the
+    refresh itself failed defensively (see `_safe_refresh`), None if no
+    refresh was needed or it succeeded."""
+    if not template0_collation_is_stale(conn):
+        return None
+    return _safe_refresh(conn, "template0", lambda: refresh_template0(conn))

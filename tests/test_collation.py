@@ -15,6 +15,8 @@ import pytest
 from collation_guard.collation import (
     database_collation_is_stale,
     process_database,
+    process_template0,
+    template0_collation_is_stale,
 )
 
 
@@ -147,3 +149,54 @@ def test_process_database_reindex_failure_is_isolated_per_relation(
         # version must stay stale, not get marked current on a
         # technicality.
         assert database_collation_is_stale(conn)
+
+
+def test_template0_refresh_without_connecting_to_it(admin_conn: psycopg.Connection) -> None:
+    """template0 disallows direct connections (datallowconn = false);
+    the stale-check and refresh both have to run from a connection to
+    a different database entirely -- here, the admin connection to
+    `postgres`. The test cluster is initialized with a real libc locale
+    (see conftest.py), so template0 carries a genuine non-NULL
+    datcollversion -- faking it to a different non-NULL string is a
+    realistic "glibc was upgraded" drift, unlike a NULL<->non-NULL
+    transition, which Postgres itself refuses to refresh. Cycle 5 of
+    the TDD sequence."""
+    admin_conn.execute(
+        "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+        "WHERE datname = 'template0'"
+    )
+    assert template0_collation_is_stale(admin_conn)
+
+    error = process_template0(admin_conn)
+
+    assert error is None
+    assert not template0_collation_is_stale(admin_conn)
+
+
+def test_process_template0_is_noop_when_not_stale(admin_conn: psycopg.Connection) -> None:
+    assert not template0_collation_is_stale(admin_conn)
+    assert process_template0(admin_conn) is None
+
+
+def test_process_template0_refresh_failure_is_reported_defensively(
+    c_locale_admin_conn: psycopg.Connection,
+) -> None:
+    """Real reproduction of Postgres's 'invalid collation version
+    change' guard: on a C-locale cluster, template0's actual collation
+    version is always NULL, so faking a non-NULL recorded version
+    creates a NULL-vs-non-NULL mismatch that REFRESH COLLATION VERSION
+    rejects outright. process_template0 must catch this, not crash,
+    and report it rather than silently losing the failure."""
+    c_locale_admin_conn.execute(
+        "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+        "WHERE datname = 'template0'"
+    )
+    assert template0_collation_is_stale(c_locale_admin_conn)
+
+    error = process_template0(c_locale_admin_conn)
+
+    assert error is not None
+    assert "invalid collation version change" in error
+    # the failed REFRESH must roll back cleanly, not leave the
+    # recorded version in a half-updated state
+    assert template0_collation_is_stale(c_locale_admin_conn)

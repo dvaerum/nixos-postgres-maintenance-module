@@ -51,15 +51,20 @@ docs/learnings/       cross-cutting operational knowledge, not tied to one decis
 - **PATCH** — backwards-compatible bug fixes only.
 
 **Single source of truth: `pyproject.toml`'s `[project] version`.**
-Bump it there and nowhere else — `flake.nix` reads
-`pname`/`version` straight out of `pyproject.toml` via
-`builtins.fromTOML`, so the Nix package version can never drift out of
-sync with the Python package version. Do not hardcode a version string
-anywhere else (`flake.nix`, module code, docs); if a version needs to
-be displayed, read it from `collation_guard.__version__`
-(`src/collation_guard/__init__.py`, itself worth keeping in sync by
-hand since `importlib.metadata` isn't available pre-install in every
-context this runs in) or `pyproject.toml`, not a second literal.
+Bump it there and nowhere else:
+
+- `flake.nix` reads `pname`/`version` straight out of `pyproject.toml`
+  via `builtins.fromTOML`, so the Nix package version can never drift
+  out of sync with the Python package version.
+- `collation_guard.__version__` (`src/collation_guard/__init__.py`)
+  reads it back via `importlib.metadata.version("collation-guard")` --
+  the value hatchling wrote into the installed package's metadata from
+  `pyproject.toml` at build time, not a second literal. Falls back to
+  `"0+unknown"` when running from a source checkout that was never
+  `pip install -e .`'d (e.g. the test suite, which imports straight off
+  `pythonpath`).
+
+Never hardcode a version string anywhere else.
 
 One version bump per release commit — don't bundle a version bump with
 an unrelated change.
