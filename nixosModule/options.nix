@@ -1,6 +1,63 @@
 { lib, ... }:
 let
   inherit (lib) mkOption mkEnableOption types;
+
+  hookType = types.submodule {
+    options = {
+      path = mkOption {
+        type = types.path;
+        description = ''
+          Executable to run, e.g. `lib.getExe pkgs.curl` or an explicit
+          path into a derivation's own `/bin` directory.
+        '';
+      };
+
+      args = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Extra arguments passed to the hook executable.";
+      };
+
+      environment = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        description = ''
+          Inline environment variables for this hook. Merged with
+          `environmentFile` and the stage's own default variables
+          (`COLLATION_GUARD_STAGE`/`DATABASE`/`CONTEXT`/`ERROR`) -- a key
+          defined by more than one of those three sources is a hard
+          error at run time (`EnvironmentCollisionError`), never a
+          silent override. See docs/decisions/0006.
+        '';
+      };
+
+      environmentFile = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = ''
+          `EnvironmentFile`-style `KEY=VALUE` file (e.g. a sops secret
+          path), merged with `environment` and the stage's own default
+          variables under the same no-collision rule.
+        '';
+      };
+
+      blockOnFailure = mkOption {
+        type = types.nullOr types.bool;
+        default = null;
+        description = ''
+          Whether a non-zero exit from this hook should be treated as a
+          failure of whatever it's attached to -- aborting the whole run
+          immediately for `preStart`; skipping just that one database
+          for `perDatabase.preStart`; adding an extra failure entry
+          (which can flip an otherwise-successful run's exit code) for
+          every other stage, including the `onFailure` companion unit's
+          own reported status. No default -- must be set explicitly, or
+          evaluation throws naming the option path. See the hook-point
+          descriptions below for exactly what each stage blocks.
+        '';
+      };
+    };
+  };
 in
 {
   options.services.postgresqlCollationGuard = {
@@ -12,6 +69,18 @@ in
         The `collation-guard` package to run. Wired automatically to this
         flake's own `packages.<system>.default` by `nixosModules.default` --
         override only to test a different build.
+      '';
+    };
+
+    maxParallelDatabases = mkOption {
+      type = types.ints.positive;
+      default = 4;
+      description = ''
+        How many databases to process concurrently (bounded, not
+        unbounded -- all databases share the same Postgres instance's
+        disk I/O, shared buffers, and WAL writer, so an unbounded
+        parallelism could make things slower, not faster, on a cluster
+        with many databases).
       '';
     };
 
@@ -40,52 +109,92 @@ in
 
     hooks = {
       preStart = mkOption {
-        type = types.listOf types.package;
+        type = types.listOf hookType;
         default = [ ];
         description = ''
-          Executables run, in order, before the guard examines any
-          database (e.g. to take a pre-emptive backup). Each must exit 0;
-          a non-zero exit aborts the guard before any check or repair
-          runs. Invoked with no arguments; JSON context is passed via the
-          `COLLATION_GUARD_CONTEXT` environment variable
-          (`{"stage": "pre_start"}`).
+          Run, in order, before the guard examines any database (e.g. to
+          take a pre-emptive backup). `blockOnFailure = true` + a
+          non-zero exit aborts the whole run immediately, before
+          enumerating or connecting to any database.
         '';
       };
 
       onSuccess = mkOption {
-        type = types.listOf types.package;
+        type = types.listOf hookType;
         default = [ ];
         description = ''
-          Executables run, in order, after the guard completes with no
-          failures (e.g. to notify success or prune old pre-start
-          backups). `COLLATION_GUARD_CONTEXT` carries
-          `{"stage": "on_success", "databases_processed": [...], "databases_repaired": [...]}`.
+          Run, in order, once -- only when every database processed with
+          zero failures (unlike `postRun`, which always runs regardless
+          of outcome). `blockOnFailure = true` + a non-zero exit adds a
+          failure to an otherwise-clean run, flipping its exit code to 1.
         '';
       };
 
       onFailure = mkOption {
-        type = types.listOf types.package;
+        type = types.listOf hookType;
         default = [ ];
         description = ''
-          Executables run, in order, after the guard fails (e.g. to alert
-          on-call or trigger a restore). Runs even if the guard's own
-          process is killed or crashes, via the unit's `OnFailure=`
-          dependency -- not just on a clean non-zero exit.
-          `COLLATION_GUARD_CONTEXT` carries
-          `{"stage": "on_failure", "failures": [{"database": ..., "relation": ..., "error": ...}, ...]}`.
+          Run after the guard fails or crashes outright -- even if the
+          guard's own process is killed, via the unit's `OnFailure=`
+          dependency, not just a clean non-zero exit (the one guarantee
+          a dead process can't arrange for itself). The *trigger* stays
+          systemd-native; the hooks themselves use the exact same
+          mechanism as every other stage. `blockOnFailure = true` + a
+          non-zero exit makes the companion unit itself report failed
+          status (visible to `systemctl --failed` and anything
+          monitoring systemd unit health) -- there's nothing left to
+          block booting at this point, the main run has already failed.
         '';
       };
 
       postRun = mkOption {
-        type = types.listOf types.package;
+        type = types.listOf hookType;
         default = [ ];
         description = ''
-          Executables run, in order, after the guard finishes -- always,
-          whether it succeeded or failed (e.g. to emit a single
-          run-completed metric/notification regardless of outcome).
-          `COLLATION_GUARD_CONTEXT` carries
-          `{"stage": "post_run", "success": true|false}`.
+          Run, in order, after the guard finishes -- always, whether it
+          succeeded or failed, and after `onSuccess` if that also ran.
+          `blockOnFailure = true` + a non-zero exit adds a failure even
+          after every database already finished cleanly, which can flip
+          an otherwise-clean run's exit code to 1.
         '';
+      };
+
+      perDatabase = {
+        preStart = mkOption {
+          type = types.listOf hookType;
+          default = [ ];
+          description = ''
+            Run, in order, before the guard examines *each* database
+            (e.g. a per-database backup) -- `COLLATION_GUARD_DATABASE`
+            names which one. `blockOnFailure = true` + a non-zero exit
+            skips processing of that one database entirely (no reindex,
+            no partition repair, not counted as processed); every other
+            database in the same run is unaffected.
+          '';
+        };
+
+        onSuccess = mkOption {
+          type = types.listOf hookType;
+          default = [ ];
+          description = ''
+            Run after a database's own processing succeeds.
+            `blockOnFailure = true` + a non-zero exit adds a failure for
+            that database even though its actual Postgres processing was
+            clean -- for a notification that's itself load-bearing.
+          '';
+        };
+
+        onFailure = mkOption {
+          type = types.listOf hookType;
+          default = [ ];
+          description = ''
+            Run after a database's own processing fails.
+            `COLLATION_GUARD_ERROR` carries a summary of what failed.
+            `blockOnFailure = true` + a non-zero exit adds a second,
+            distinct failure entry alongside the database's original one
+            -- both visible independently.
+          '';
+        };
       };
     };
   };

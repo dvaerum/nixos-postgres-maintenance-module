@@ -35,12 +35,15 @@
 
     # Cycle 1: the glibc locale store path actually substituted into
     # the unit (config.i18n.glibcLocales) reached the script and got
-    # written as the stamp.
+    # written as the stamp. Checked by containment, not startswith --
+    # NixOS's own postgresql module already sets a default comment
+    # ("default administrative connection database") on this database,
+    # and the guard correctly appends its own line after it rather than
+    # clobbering it (see docs/decisions/0006's COMMENT ON preserve/
+    # append fix).
     stamp = machine.succeed(
         """runuser -u postgres -- psql -tAc "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = 'postgres';" """
     ).strip()
-    assert stamp.startswith(
-        "collation-guard:glibcLocales=/nix/store/"
-    ), f"unexpected stamp: {stamp!r}"
+    assert "collation-guard:glibcLocales=/nix/store/" in stamp, f"unexpected stamp: {stamp!r}"
   '';
 }
