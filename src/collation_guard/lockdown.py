@@ -84,22 +84,7 @@ class LockdownManager:
             else:
                 self._locked.discard(request.dbname)
             self._write_file()
-            before = self._conn.execute("SELECT pg_conf_load_time()").fetchone()
-            self._conn.execute("SELECT pg_reload_conf()")
-            # pg_reload_conf() only requests a reload (SIGHUP) -- the
-            # postmaster re-reads pg_hba.conf asynchronously, so under
-            # rapid lock/unlock traffic the SQL call can return before
-            # the new rules are actually in effect (confirmed
-            # empirically: a brand-new connection could occasionally
-            # still succeed/fail against the stale rules for a short
-            # window). pg_conf_load_time() is the authoritative signal
-            # Postgres itself updates once a reload has genuinely
-            # completed -- poll until it changes before treating this
-            # request as applied. Since this manager is the single
-            # writer and processes requests strictly FIFO, there's
-            # never a second reload in flight while polling for this
-            # one's completion.
-            self._wait_for_reload(before)
+            _reload_and_confirm(self._conn)
             if request.action == "lock":
                 self._conn.execute(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -107,18 +92,6 @@ class LockdownManager:
                     (request.dbname,),
                 )
             request.done.set()
-
-    def _wait_for_reload(self, before: object) -> None:
-        deadline = time.monotonic() + _RELOAD_CONFIRM_TIMEOUT
-        while time.monotonic() < deadline:
-            after = self._conn.execute("SELECT pg_conf_load_time()").fetchone()
-            if after != before:
-                return
-            time.sleep(0.001)
-        raise RuntimeError(
-            f"pg_hba.conf reload did not complete within {_RELOAD_CONFIRM_TIMEOUT}s "
-            "(pg_conf_load_time() never advanced)"
-        )
 
     def _write_file(self) -> None:
         if not self._locked:
@@ -132,6 +105,49 @@ class LockdownManager:
             f.write(f"local   {dblist}   all                reject\n")
             f.write(f"host    {dblist}   all   0.0.0.0/0    reject\n")
             f.write(f"host    {dblist}   all   ::/0         reject\n")
+
+
+def _reload_and_confirm(conn: psycopg.Connection) -> None:
+    """pg_reload_conf() only requests a reload (SIGHUP) -- the
+    postmaster re-reads pg_hba.conf asynchronously, so a SQL call
+    returning doesn't mean the new rules are in effect yet (confirmed
+    empirically: a brand-new connection could occasionally still
+    succeed/fail against the stale rules for a short window
+    afterward). pg_conf_load_time() is the authoritative signal
+    Postgres itself updates once a reload has genuinely completed --
+    poll until it changes before returning."""
+    before = conn.execute("SELECT pg_conf_load_time()").fetchone()
+    conn.execute("SELECT pg_reload_conf()")
+    deadline = time.monotonic() + _RELOAD_CONFIRM_TIMEOUT
+    while time.monotonic() < deadline:
+        after = conn.execute("SELECT pg_conf_load_time()").fetchone()
+        if after != before:
+            return
+        time.sleep(0.001)
+    raise RuntimeError(
+        f"pg_hba.conf reload did not complete within {_RELOAD_CONFIRM_TIMEOUT}s "
+        "(pg_conf_load_time() never advanced)"
+    )
+
+
+def cleanup_lockdown_file(host: str, port: str, lockdown_path: str) -> None:
+    """Unconditional crash-recovery step, called from the --on-failure
+    entry point independently of any LockdownManager (which is dead by
+    the time this runs, or never existed in this process at all): if
+    the lockdown file exists, delete it and reload -- regardless of
+    which/how many databases were locked at the moment of the crash.
+    A missing file is a silent no-op, not an error -- the common case,
+    since most crashes happen with nothing locked at all."""
+    try:
+        os.remove(lockdown_path)
+    except FileNotFoundError:
+        return
+    with psycopg.connect(
+        f"host={host} port={port} dbname=postgres application_name=collation-guard",
+        autocommit=True,
+        prepare_threshold=None,
+    ) as conn:
+        _reload_and_confirm(conn)
 
 
 class NullLockdownManager:

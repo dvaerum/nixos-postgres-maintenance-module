@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 
 import psycopg
 
-from . import collation, partitions
+from . import collation, lockdown, partitions
 from .hooks import Hook, HooksConfig, load_hooks, run_hook
 
 logger = logging.getLogger("collation_guard")
@@ -350,13 +350,29 @@ def _recover_last_context(context_file: str) -> tuple[dict[str, object], str]:
     return data, error
 
 
-def run_on_failure(hooks_file: str, context_file: str) -> int:
+def run_on_failure(
+    hooks_file: str,
+    context_file: str,
+    *,
+    lockdown_path: str | None = None,
+    host: str | None = None,
+    port: str | None = None,
+) -> int:
     """Second entry point, invoked by the postgresql-collation-guard-
     on-failure.service companion unit after the main run failed or
     crashed outright (systemd's OnFailure=, the one guarantee a dead
     process can't arrange for itself). Reads the same hooks file as the
     main run and runs hooks.onFailure through the exact same
-    run_hook() as every other stage -- no separate implementation."""
+    run_hook() as every other stage -- no separate implementation.
+
+    Also unconditionally cleans up a lockdown file left behind by a
+    crash mid-lock, independent of any configured onFailure hooks --
+    see lockdown.cleanup_lockdown_file(). A no-op when lockdown_path is
+    None (connectionLockdown.enable = false)."""
+    if lockdown_path is not None:
+        assert host is not None and port is not None
+        lockdown.cleanup_lockdown_file(host, port, lockdown_path)
+
     hooks = load_hooks(hooks_file)
     context, error = _recover_last_context(context_file)
     report = RunReport()
@@ -398,7 +414,11 @@ def main() -> int:
 
     if args.on_failure:
         return run_on_failure(
-            os.environ["COLLATION_GUARD_HOOKS_FILE"], os.environ["COLLATION_GUARD_CONTEXT_FILE"]
+            os.environ["COLLATION_GUARD_HOOKS_FILE"],
+            os.environ["COLLATION_GUARD_CONTEXT_FILE"],
+            lockdown_path=os.environ.get("COLLATION_GUARD_LOCKDOWN_FILE"),
+            host=os.environ.get("PGHOST"),
+            port=os.environ.get("PGPORT"),
         )
 
     hooks_file = os.environ.get("COLLATION_GUARD_HOOKS_FILE")

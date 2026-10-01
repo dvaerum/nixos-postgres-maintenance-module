@@ -731,6 +731,65 @@ def test_run_on_failure_context_falls_back_to_empty_dict_with_no_context_file(tm
     assert json.loads(out.read_text()) == {}
 
 
+def test_run_on_failure_cleans_up_an_active_lockdown_file(
+    pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path, tmp_path
+) -> None:
+    """Simulates a crash mid-lock (an active reject rule, loaded, with
+    no running LockdownManager) -- the --on-failure entry point must
+    clean it up unconditionally, independent of any configured
+    onFailure hooks."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_lockdown_cleanup"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(f'CREATE DATABASE "{name}"')
+    lockdown_conf_path.write_text(f"local   {name}   all   reject\n")
+    admin_conn.execute("SELECT pg_reload_conf()")
+    try:
+        # sanity check: the simulated crash really did leave it locked
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None)
+
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text("{}")
+        context_file = tmp_path / "context.json"
+        context_file.write_text(json.dumps({"failures": [], "success": True}))
+
+        main.run_on_failure(
+            str(hooks_file),
+            str(context_file),
+            lockdown_path=str(lockdown_conf_path),
+            host=host,
+            port=port,
+        )
+
+        assert not lockdown_conf_path.exists()
+        with psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None):
+            pass
+    finally:
+        lockdown_conf_path.unlink(missing_ok=True)
+        admin_conn.execute("SELECT pg_reload_conf()")
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_run_on_failure_lockdown_cleanup_is_a_no_op_when_no_file_exists(
+    tmp_path, lockdown_conf_path
+) -> None:
+    hooks_file = tmp_path / "hooks.json"
+    hooks_file.write_text("{}")
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps({"failures": [], "success": True}))
+
+    exit_code = main.run_on_failure(
+        str(hooks_file),
+        str(context_file),
+        lockdown_path=str(lockdown_conf_path),
+        host="unused",
+        port="unused",
+    )
+
+    assert exit_code == 0
+
+
 def test_run_processes_many_databases_correctly_under_real_concurrency(
     pg_dsn: str, admin_conn: psycopg.Connection
 ) -> None:
