@@ -78,6 +78,7 @@
 
         checks = {
           unitTests = collation-guard;
+          validateHook = import ./tests/validate-hook.nix { inherit pkgs; };
         }
         // nixosTests;
 

@@ -10,19 +10,9 @@ let
 
   contextFile = "/run/postgresql-collation-guard/last-run.json";
 
-  # Every hook must set blockOnFailure explicitly -- the type default
-  # (null) is deliberately invalid at use, forcing an explicit choice
-  # at configuration time rather than a runtime surprise. See
-  # docs/decisions/0006.
-  validateHook =
-    optionPath: hook:
-    if hook.blockOnFailure == null then
-      throw ''
-        services.postgresqlCollationGuard.hooks.${optionPath}: every hook must set
-        blockOnFailure explicitly (true or false) -- got null (the unset default).
-      ''
-    else
-      hook;
+  # Extracted to its own file (nixosModule/validate-hook.nix) so it's
+  # testable in isolation -- see tests/validate-hook.nix.
+  validateHook = import ./validate-hook.nix;
 
   hookToJSON = hook: {
     inherit (hook)
