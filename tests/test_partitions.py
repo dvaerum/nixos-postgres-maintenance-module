@@ -146,3 +146,80 @@ def test_cross_partition_update_through_root_moves_a_row_to_its_correct_partitio
     in_b = conn.execute("SELECT k FROM child_b WHERE k = 'zebra'").fetchone()
     assert in_a is None
     assert in_b is not None
+
+
+def test_repair_row_does_not_fire_user_triggers(partitioned_db: psycopg.Connection) -> None:
+    """Cycle 8: repair_row()'s internal UPDATE must not fire a
+    user-defined trigger as a side effect -- it's maintenance, not an
+    application-level write. Proven with a counter trigger, not just
+    trusted from reading DISABLE TRIGGER USER's docs."""
+    conn = partitioned_db
+    conn.execute("CREATE TABLE trigger_calls (n integer NOT NULL)")
+    conn.execute("INSERT INTO trigger_calls VALUES (0)")
+    conn.execute(
+        """
+        CREATE FUNCTION count_trigger() RETURNS trigger AS $$
+        BEGIN
+            UPDATE trigger_calls SET n = n + 1;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+    )
+    conn.execute(
+        "CREATE TRIGGER count_updates BEFORE UPDATE ON child_a FOR EACH ROW "
+        "EXECUTE FUNCTION count_trigger()"
+    )
+    conn.commit()
+
+    (ctid,) = conn.execute("SELECT ctid FROM child_a WHERE k = 'apple'").fetchone()
+    repair_row(conn, "public", "parent", "child_a", ["k"], ctid)
+    conn.commit()
+
+    (count,) = conn.execute("SELECT n FROM trigger_calls").fetchone()
+    assert count == 0
+
+    # Sanity check: the trigger genuinely works and this isn't a
+    # vacuous pass -- a plain UPDATE outside of repair_row() must still
+    # increment it. Re-fetch ctid: repair_row's own UPDATE already gave
+    # the row a new tuple version (MVCC creates one even for an
+    # unchanged value), so the old ctid no longer points at the live row.
+    (ctid,) = conn.execute("SELECT ctid FROM child_a WHERE k = 'apple'").fetchone()
+    conn.execute("UPDATE child_a SET k = k WHERE ctid = %s::tid", (ctid,))
+    conn.commit()
+    (count_after_plain_update,) = conn.execute("SELECT n FROM trigger_calls").fetchone()
+    assert count_after_plain_update == 1
+
+
+def test_repair_row_does_not_needlessly_cascade_an_unchanged_foreign_key(
+    partitioned_db: psycopg.Connection,
+) -> None:
+    """Cycle 8's FK-enforcement angle: an incoming ON UPDATE CASCADE
+    foreign key is enforced via Postgres's own internally-generated
+    constraint trigger on `parent` -- not a user trigger, so DISABLE
+    TRIGGER USER never touches it (this is what makes USER, not ALL,
+    load-bearing: see BUG #18516 in repair_row()'s docstring). Postgres
+    additionally skips re-firing that constraint trigger at all when
+    the referenced key's value hasn't actually changed (confirmed via
+    research, verified here): the referencing row must not be
+    physically rewritten by repair_row()'s self-assignment UPDATE."""
+    conn = partitioned_db
+    conn.execute("ALTER TABLE parent ADD CONSTRAINT parent_k_unique UNIQUE (k)")
+    conn.execute(
+        "CREATE TABLE referencing (id serial PRIMARY KEY, parent_k text "
+        "REFERENCES parent (k) ON UPDATE CASCADE)"
+    )
+    conn.execute("INSERT INTO referencing (parent_k) VALUES ('apple')")
+    conn.commit()
+
+    (xmin_before,) = conn.execute(
+        "SELECT xmin FROM referencing WHERE parent_k = 'apple'"
+    ).fetchone()
+
+    (ctid,) = conn.execute("SELECT ctid FROM child_a WHERE k = 'apple'").fetchone()
+    repair_row(conn, "public", "parent", "child_a", ["k"], ctid)
+    conn.commit()
+
+    row = conn.execute("SELECT xmin FROM referencing WHERE parent_k = 'apple'").fetchone()
+    assert row is not None
+    assert row[0] == xmin_before
