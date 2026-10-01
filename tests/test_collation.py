@@ -13,9 +13,13 @@ import psycopg
 import pytest
 
 from collation_guard.collation import (
+    c_utf8_databases,
+    connectable_databases,
     database_collation_is_stale,
+    glibc_stamp,
     process_database,
     process_template0,
+    set_glibc_stamp,
     template0_collation_is_stale,
 )
 
@@ -193,10 +197,65 @@ def test_process_template0_refresh_failure_is_reported_defensively(
     )
     assert template0_collation_is_stale(c_locale_admin_conn)
 
-    error = process_template0(c_locale_admin_conn)
+    try:
+        error = process_template0(c_locale_admin_conn)
 
-    assert error is not None
-    assert "invalid collation version change" in error
-    # the failed REFRESH must roll back cleanly, not leave the
-    # recorded version in a half-updated state
-    assert template0_collation_is_stale(c_locale_admin_conn)
+        assert error is not None
+        assert "invalid collation version change" in error
+        # the failed REFRESH must roll back cleanly, not leave the
+        # recorded version in a half-updated state
+        assert template0_collation_is_stale(c_locale_admin_conn)
+    finally:
+        # c_locale_pg_dsn is a session-scoped, shared cluster -- reset
+        # the corruption injected above so later tests in this session
+        # see a pristine template0 again, not whatever state this test
+        # happened to leave behind.
+        c_locale_admin_conn.execute(
+            "UPDATE pg_database SET datcollversion = NULL WHERE datname = 'template0'"
+        )
+
+
+def test_glibc_stamp_is_none_when_never_recorded(admin_conn: psycopg.Connection) -> None:
+    assert glibc_stamp(admin_conn) is None
+
+
+def test_set_glibc_stamp_round_trips(admin_conn: psycopg.Connection) -> None:
+    set_glibc_stamp(admin_conn, "/nix/store/abc123-glibc-locales-2.42")
+    assert glibc_stamp(admin_conn) == "/nix/store/abc123-glibc-locales-2.42"
+
+    # advancing it again must replace, not append
+    set_glibc_stamp(admin_conn, "/nix/store/def456-glibc-locales-2.42")
+    assert glibc_stamp(admin_conn) == "/nix/store/def456-glibc-locales-2.42"
+
+
+def test_c_utf8_databases_flags_only_c_dot_locales(
+    c_locale_admin_conn: psycopg.Connection,
+) -> None:
+    # Needs the dedicated C-locale cluster: the main cluster's template0
+    # carries a real (non-NULL) version (see conftest.py), and Postgres
+    # refuses to create a differently-versioned database from a
+    # versioned template0 (same constraint documented in
+    # test_process_template0_refresh_failure_is_reported_defensively).
+    conn = c_locale_admin_conn
+    for name in ("cg_cutf8", "cg_libc"):
+        conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    conn.execute(
+        "CREATE DATABASE cg_cutf8 LOCALE_PROVIDER libc LOCALE 'C.UTF-8' TEMPLATE template0"
+    )
+    conn.execute(
+        "CREATE DATABASE cg_libc LOCALE_PROVIDER libc LOCALE 'en_US.UTF-8' TEMPLATE template0"
+    )
+    try:
+        found = c_utf8_databases(conn)
+        assert "cg_cutf8" in found
+        assert "cg_libc" not in found
+    finally:
+        conn.execute('DROP DATABASE IF EXISTS "cg_cutf8"')
+        conn.execute('DROP DATABASE IF EXISTS "cg_libc"')
+
+
+def test_connectable_databases_excludes_template0(admin_conn: psycopg.Connection) -> None:
+    found = connectable_databases(admin_conn)
+    assert "postgres" in found
+    assert "template0" not in found
+    assert "template1" in found

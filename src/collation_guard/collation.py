@@ -204,6 +204,70 @@ def process_database(conn: psycopg.Connection) -> DatabaseResult:
     return DatabaseResult(reindexed=reindexed, failed=failed)
 
 
+GLIBC_STAMP_PREFIX = "collation-guard:glibcLocales="
+
+
+def connectable_databases(conn: psycopg.Connection) -> list[str]:
+    """Every database in the cluster that can actually be connected to
+    -- template0 is deliberately excluded (datallowconn is always false
+    for it; see process_template0() for its own, connection-free path).
+    """
+    rows = conn.execute("SELECT datname FROM pg_database WHERE datallowconn").fetchall()
+    return [str(r[0]) for r in rows]
+
+
+def glibc_stamp(conn: psycopg.Connection) -> str | None:
+    """The glibcLocales store path recorded the last time the C.UTF-8
+    stamp was successfully advanced, or None if never recorded (a
+    brand-new cluster, or one that predates this guard). Stored via
+    COMMENT ON the `postgres` database -- a shared pg_shdescription
+    catalog entry, cluster-wide, survives pg_dumpall/pg_upgrade -- not a
+    $PGDATA file, which is one accidental `rm` or one backup that
+    forgot to include it away from losing the only evidence a reindex
+    is still owed. The *store path*, not a bare glibc version string,
+    is the comparison key: nixpkgs#245360 (fixed in commit 43da9e8ff)
+    showed the same glibc version producing a different, non-
+    deterministically-built locale archive for ~6 weeks in 2023, so a
+    version number alone isn't a safe comparison key."""
+    row = conn.execute(
+        "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = 'postgres'"
+    ).fetchone()
+    value = str(row[0]) if row is not None and row[0] is not None else None
+    if value is None or not value.startswith(GLIBC_STAMP_PREFIX):
+        return None
+    return value[len(GLIBC_STAMP_PREFIX) :]
+
+
+def set_glibc_stamp(conn: psycopg.Connection, glibc_locales_path: str) -> None:
+    # COMMENT ON is a utility statement -- Postgres's grammar requires a
+    # literal string here, not a bind parameter (confirmed empirically:
+    # `IS %s` raises a syntax error), so the value is escaped via
+    # sql.Literal instead of the usual parameterized query.
+    conn.execute(
+        sql.SQL("COMMENT ON DATABASE postgres IS {}").format(
+            sql.Literal(f"{GLIBC_STAMP_PREFIX}{glibc_locales_path}")
+        )
+    )
+    conn.commit()
+
+
+def c_utf8_databases(conn: psycopg.Connection) -> list[str]:
+    """Databases using a C.* libc locale -- Postgres never records a
+    version for these at all (confirmed: get_collation_actual_version()
+    returns NULL for C/C.*/POSIX regardless of library version), so
+    only the glibc stamp above can catch a behavior change (glibc 2.35,
+    2022, changed C.UTF-8's actual behavior; see README.md)."""
+    rows = conn.execute(
+        """
+        SELECT datname FROM pg_database
+        WHERE datallowconn
+          AND datlocprovider = 'c'
+          AND (datcollate ILIKE 'C.%' OR datctype ILIKE 'C.%')
+        """
+    ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
 def process_template0(conn: psycopg.Connection) -> str | None:
     """Refresh `template0`'s recorded collation version if stale.
     `template0` carries no user objects, so there's nothing to
