@@ -42,6 +42,10 @@ class RunReport:
         return not self.failures
 
 
+def _summarize_failures(report: RunReport) -> str:
+    return "; ".join(f"{f.database}.{f.relation}: {f.error}" for f in report.failures)
+
+
 def _connect(host: str, port: str, dbname: str) -> psycopg.Connection:
     return psycopg.connect(f"host={host} port={port} dbname={dbname}", prepare_threshold=None)
 
@@ -256,6 +260,11 @@ def run(
 
     if report.success:
         _run_hooks(hooks.on_success, "on_success", report)
+
+    # postRun fires regardless of outcome -- unlike onSuccess, which is
+    # deliberately gated on a clean run.
+    post_run_error = None if report.success else _summarize_failures(report)
+    _run_hooks(hooks.post_run, "post_run", report, error=post_run_error)
 
     return report
 

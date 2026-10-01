@@ -381,3 +381,60 @@ def test_run_per_database_onfailure_does_not_fire_on_a_successful_database(pg_ds
     )
 
     assert report.success
+
+
+def test_run_postrun_hook_blocking_failure_flips_an_otherwise_clean_run(pg_dsn: str) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(
+        path=sys.executable, args=["-c", "import sys; sys.exit(1)"], block_on_failure=True
+    )
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(post_run=[hook]),
+    )
+
+    assert "postgres" in report.databases_processed
+    assert not report.success
+
+
+def test_run_postrun_hook_non_blocking_failure_leaves_clean_run_clean(pg_dsn: str) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(
+        path=sys.executable, args=["-c", "import sys; sys.exit(1)"], block_on_failure=False
+    )
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(post_run=[hook]),
+    )
+
+    assert report.success
+
+
+def test_run_postrun_hook_fires_even_when_a_database_already_failed(
+    pg_dsn: str, failing_database: str, tmp_path
+) -> None:
+    host, port = _host_port(pg_dsn)
+    marker = tmp_path / "postrun-fired"
+    hook = Hook(path=sys.executable, args=["-c", f"open({str(marker)!r}, 'w')"])
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(post_run=[hook]),
+    )
+
+    assert not report.success
+    assert marker.exists(), "postRun must fire regardless of outcome, unlike onSuccess"
