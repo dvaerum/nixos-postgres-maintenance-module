@@ -122,9 +122,19 @@ def _process_database(
 
     report.databases_processed.append(dbname)
 
-    if len(report.failures) == failures_before:
+    new_failures = report.failures[failures_before:]
+    if not new_failures:
         _run_hooks(
             hooks.per_database.on_success, "database_success", report, database=dbname
+        )
+    else:
+        error = "; ".join(f"{f.relation}: {f.error}" for f in new_failures)
+        _run_hooks(
+            hooks.per_database.on_failure,
+            "database_failure",
+            report,
+            database=dbname,
+            error=error,
         )
 
 

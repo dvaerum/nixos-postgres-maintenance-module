@@ -6,6 +6,7 @@ as the real systemd ExecStart does, just without systemd itself.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 
 import psycopg
 import pytest
@@ -17,6 +18,47 @@ from collation_guard.hooks import Hook, HooksConfig, PerDatabaseHooks
 def _host_port(pg_dsn: str) -> tuple[str, str]:
     parts = dict(item.split("=", 1) for item in pg_dsn.split())
     return parts["host"], parts["port"]
+
+
+@pytest.fixture
+def failing_database(admin_conn: psycopg.Connection, pg_dsn: str) -> Iterator[str]:
+    """A real database with a genuine REINDEX failure -- the same
+    indisready duplicate-key reproduction used throughout this project
+    (see test_collation.py's cycle 4)."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_failing_database"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(
+        f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
+        f"TEMPLATE template0"
+    )
+    try:
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name}", prepare_threshold=None
+        ) as conn:
+            conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text UNIQUE)")
+            conn.execute("INSERT INTO widgets (name) VALUES ('alpha')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_index SET indisready = false "
+                "WHERE indexrelid = 'widgets_name_key'::regclass"
+            )
+            conn.commit()
+            conn.execute("INSERT INTO widgets (name) VALUES ('alpha')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_index SET indisready = true "
+                "WHERE indexrelid = 'widgets_name_key'::regclass"
+            )
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+                "WHERE datname = current_database()"
+            )
+            conn.commit()
+        yield name
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
 
 def test_run_is_a_clean_success_on_an_unremarkable_cluster(pg_dsn: str) -> None:
@@ -161,59 +203,23 @@ def test_run_onsuccess_hook_fires_on_a_clean_run_and_blocking_failure_flips_exit
 
 
 def test_run_onsuccess_hook_does_not_fire_when_a_database_already_failed(
-    pg_dsn: str, admin_conn: psycopg.Connection, tmp_path
+    pg_dsn: str, failing_database: str, tmp_path
 ) -> None:
     host, port = _host_port(pg_dsn)
-    name = "cg_main_test_onsuccess_gating"
-    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
-    admin_conn.execute(
-        f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
-        f"TEMPLATE template0"
+    marker = tmp_path / "onsuccess-fired"
+    onsuccess_hook = Hook(path=sys.executable, args=["-c", f"open({str(marker)!r}, 'w')"])
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(on_success=[onsuccess_hook]),
     )
-    try:
-        with psycopg.connect(
-            f"host={host} port={port} dbname={name}", prepare_threshold=None
-        ) as conn:
-            # same real reproduction used in test_collation.py's cycle 4:
-            # a duplicate that bypasses the unique index, so REINDEX
-            # genuinely fails.
-            conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text UNIQUE)")
-            conn.execute("INSERT INTO widgets (name) VALUES ('alpha')")
-            conn.commit()
-            conn.execute(
-                "UPDATE pg_index SET indisready = false "
-                "WHERE indexrelid = 'widgets_name_key'::regclass"
-            )
-            conn.commit()
-            conn.execute("INSERT INTO widgets (name) VALUES ('alpha')")
-            conn.commit()
-            conn.execute(
-                "UPDATE pg_index SET indisready = true "
-                "WHERE indexrelid = 'widgets_name_key'::regclass"
-            )
-            conn.commit()
-            conn.execute(
-                "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
-                "WHERE datname = current_database()"
-            )
-            conn.commit()
 
-        marker = tmp_path / "onsuccess-fired"
-        onsuccess_hook = Hook(path=sys.executable, args=["-c", f"open({str(marker)!r}, 'w')"])
-
-        report = main.run(
-            host,
-            port,
-            glibc_locales_path="/nix/store/test-glibc-locales",
-            partition_repair_enabled=True,
-            max_repair_attempts=10,
-            hooks=HooksConfig(on_success=[onsuccess_hook]),
-        )
-
-        assert not report.success
-        assert not marker.exists(), "onSuccess hook must not fire when a database failed"
-    finally:
-        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    assert not report.success
+    assert not marker.exists(), "onSuccess hook must not fire when a database failed"
 
 
 def test_run_prestart_hook_non_blocking_failure_still_processes_databases(pg_dsn: str) -> None:
@@ -317,4 +323,61 @@ def test_run_per_database_onsuccess_non_blocking_failure_leaves_database_success
     )
 
     assert "template1" in report.databases_processed
+    assert report.success
+
+
+def test_run_per_database_onfailure_blocking_failure_adds_a_second_distinct_failure(
+    pg_dsn: str, failing_database: str
+) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(path=sys.executable, args=["-c", "import sys; sys.exit(1)"], block_on_failure=True)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(on_failure=[hook])),
+    )
+
+    db_failures = [f for f in report.failures if f.database == failing_database]
+    # the original REINDEX failure, plus a second, distinct entry for
+    # the failed onFailure hook itself -- both visible independently.
+    assert len(db_failures) == 2
+    assert any(f.relation == "database_failure" for f in db_failures)
+
+
+def test_run_per_database_onfailure_non_blocking_failure_leaves_just_the_original(
+    pg_dsn: str, failing_database: str
+) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(path=sys.executable, args=["-c", "import sys; sys.exit(1)"], block_on_failure=False)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(on_failure=[hook])),
+    )
+
+    db_failures = [f for f in report.failures if f.database == failing_database]
+    assert len(db_failures) == 1
+
+
+def test_run_per_database_onfailure_does_not_fire_on_a_successful_database(pg_dsn: str) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(path=sys.executable, args=["-c", "import sys; sys.exit(1)"], block_on_failure=True)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(on_failure=[hook])),
+    )
+
     assert report.success
