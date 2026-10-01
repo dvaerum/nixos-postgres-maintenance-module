@@ -11,7 +11,7 @@ import psycopg
 import pytest
 
 from collation_guard import main
-from collation_guard.hooks import Hook, HooksConfig
+from collation_guard.hooks import Hook, HooksConfig, PerDatabaseHooks
 
 
 def _host_port(pg_dsn: str) -> tuple[str, str]:
@@ -232,4 +232,47 @@ def test_run_prestart_hook_non_blocking_failure_still_processes_databases(pg_dsn
     )
 
     assert report.success
+    assert "postgres" in report.databases_processed
+
+
+_FAIL_FOR_TEMPLATE1 = (
+    "import os, sys; sys.exit(1 if os.environ['COLLATION_GUARD_DATABASE'] == 'template1' else 0)"
+)
+
+
+def test_run_per_database_prestart_blocking_failure_skips_only_that_database(
+    pg_dsn: str,
+) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(path=sys.executable, args=["-c", _FAIL_FOR_TEMPLATE1], block_on_failure=True)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(pre_start=[hook])),
+    )
+
+    assert not report.success
+    assert "template1" not in report.databases_processed
+    assert "postgres" in report.databases_processed
+
+
+def test_run_per_database_prestart_non_blocking_failure_still_processes_it(pg_dsn: str) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(path=sys.executable, args=["-c", _FAIL_FOR_TEMPLATE1], block_on_failure=False)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(pre_start=[hook])),
+    )
+
+    assert report.success
+    assert "template1" in report.databases_processed
     assert "postgres" in report.databases_processed

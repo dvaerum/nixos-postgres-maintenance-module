@@ -85,8 +85,17 @@ def _process_database(
     dbname: str,
     partition_repair_enabled: bool,
     max_attempts: int,
+    hooks: HooksConfig,
     report: RunReport,
 ) -> None:
+    if not _run_hooks(
+        hooks.per_database.pre_start, "database_pre_start", report, database=dbname
+    ):
+        # blockOnFailure=true: skip this database entirely -- no
+        # process_database, no partition repair, not added to
+        # databases_processed. Other databases are unaffected.
+        return
+
     with _connect(host, port, dbname) as conn:
         result = collation.process_database(conn)
         if result.reindexed:
@@ -152,21 +161,35 @@ def _process_glibc_stamp(host: str, port: str, glibc_locales_path: str, report: 
 GLOBAL = "(global)"
 
 
-def _run_global_hooks(hooks: list[Hook], stage: str, report: RunReport) -> bool:
-    """Runs a list of global (non-per-database) hooks for one stage.
-    Returns False if a blockOnFailure=true hook failed (the caller
-    decides what that means -- abort now, for preStart; just a failure
-    entry for onSuccess/postRun), True otherwise."""
+def _run_hooks(
+    hooks: list[Hook],
+    stage: str,
+    report: RunReport,
+    *,
+    database: str | None = None,
+    context: dict[str, object] | None = None,
+    error: str | None = None,
+) -> bool:
+    """Runs a list of hooks for one stage -- global (database=None,
+    reported under GLOBAL) or per-database. Returns False if a
+    blockOnFailure=true hook failed (the caller decides what that means
+    -- abort now for preStart, skip-this-database for
+    perDatabase.preStart, just an extra failure entry for the rest),
+    True otherwise. Every failing hook is recorded, not just the first
+    one, and every configured hook still runs regardless of an earlier
+    one's outcome."""
     ok = True
     for hook in hooks:
-        result = run_hook(hook, stage=stage)
+        result = run_hook(hook, stage=stage, database=database, context=context, error=error)
         if result.ok:
             continue
-        logger.warning("%s hook %s failed: %s", stage, hook.path, result.stderr)
+        logger.warning(
+            "%s hook %s failed for %s: %s", stage, hook.path, database or GLOBAL, result.stderr
+        )
         if result.block_on_failure:
             report.failures.append(
                 Failure(
-                    database=GLOBAL,
+                    database=database or GLOBAL,
                     relation=stage,
                     error=f"{stage} hook {hook.path} failed (exit {result.returncode})",
                 )
@@ -188,7 +211,7 @@ def run(
     report = RunReport()
     hooks = hooks or HooksConfig()
 
-    if not dry_run and not _run_global_hooks(hooks.pre_start, "pre_start", report):
+    if not dry_run and not _run_hooks(hooks.pre_start, "pre_start", report):
         return report
 
     with _connect(host, port, "postgres") as admin_conn:
@@ -210,10 +233,12 @@ def run(
     _process_glibc_stamp(host, port, glibc_locales_path, report)
 
     for dbname in databases:
-        _process_database(host, port, dbname, partition_repair_enabled, max_repair_attempts, report)
+        _process_database(
+            host, port, dbname, partition_repair_enabled, max_repair_attempts, hooks, report
+        )
 
     if report.success:
-        _run_global_hooks(hooks.on_success, "on_success", report)
+        _run_hooks(hooks.on_success, "on_success", report)
 
     return report
 
