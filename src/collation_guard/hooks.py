@@ -11,6 +11,29 @@ module itself.
 from __future__ import annotations
 
 
+class EnvironmentCollisionError(Exception):
+    """Raised when the same environment variable name is defined by
+    more than one source for a single hook invocation. Deliberately
+    strict: silently letting one source shadow another is exactly the
+    kind of bug that's invisible until the wrong value reaches a hook
+    in production (see docs/decisions/0006)."""
+
+
+def merge_environment(*sources: dict[str, str]) -> dict[str, str]:
+    """Merges environment dicts. Any key present in more than one
+    source raises EnvironmentCollisionError -- never "last one wins,"
+    regardless of whether the colliding values happen to be equal."""
+    merged: dict[str, str] = {}
+    for source in sources:
+        for key, value in source.items():
+            if key in merged:
+                raise EnvironmentCollisionError(
+                    f"environment variable {key!r} is defined by more than one source"
+                )
+            merged[key] = value
+    return merged
+
+
 def parse_environment_file(path: str) -> dict[str, str]:
     """Parses a systemd-EnvironmentFile-style KEY=VALUE file: blank
     lines and lines starting with '#' are ignored, and a value may be
