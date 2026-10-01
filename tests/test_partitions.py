@@ -280,3 +280,77 @@ def test_repair_partition_table_gives_up_after_max_attempts(
     assert result.exhausted is True
     assert not result.ok
     assert result.repaired == 5 * 2  # 2 non-ruled children, 1 fake row each, every attempt
+
+
+@pytest.fixture
+def two_level_db(test_db: psycopg.Connection) -> psycopg.Connection:
+    """parent -> {child_a (itself sub-partitioned into child_a1/child_a2), child_b}."""
+    conn = test_db
+    conn.execute("CREATE TABLE parent (id serial, k text) PARTITION BY RANGE (k)")
+    conn.execute(
+        "CREATE TABLE child_a PARTITION OF parent FOR VALUES FROM (MINVALUE) TO ('m') "
+        "PARTITION BY RANGE (k)"
+    )
+    conn.execute("CREATE TABLE child_a1 PARTITION OF child_a FOR VALUES FROM (MINVALUE) TO ('e')")
+    conn.execute("CREATE TABLE child_a2 PARTITION OF child_a FOR VALUES FROM ('e') TO ('m')")
+    conn.execute("CREATE TABLE child_b PARTITION OF parent FOR VALUES FROM ('m') TO (MAXVALUE)")
+    conn.execute("INSERT INTO parent (k) VALUES ('apple')")  # -> child_a1
+    conn.commit()
+    return conn
+
+
+def test_partition_leaves_descends_through_sub_partitioned_children(
+    two_level_db: psycopg.Connection,
+) -> None:
+    assert partitions.partition_leaves(two_level_db, "public", "parent") == [
+        "child_a1",
+        "child_a2",
+        "child_b",
+    ]
+
+
+def test_cross_partition_update_through_root_moves_a_row_across_sub_partition_levels(
+    two_level_db: psycopg.Connection,
+) -> None:
+    """A deep-leaf analogue of
+    test_cross_partition_update_through_root_moves_a_row_to_its_correct_partition:
+    confirms routing through the absolute root works at depth, moving a
+    row from a leaf under one branch (child_a1, under child_a) directly
+    to a leaf under a completely different branch (child_b) -- not just
+    between siblings under the same immediate parent."""
+    conn = two_level_db
+    (ctid,) = conn.execute("SELECT ctid FROM child_a1 WHERE k = 'apple'").fetchone()
+
+    conn.execute("ALTER TABLE child_a1 DISABLE TRIGGER USER")
+    try:
+        conn.execute(
+            "UPDATE parent SET k = 'zebra' WHERE tableoid = 'child_a1'::regclass "
+            "AND ctid = %s::tid",
+            (ctid,),
+        )
+    finally:
+        conn.execute("ALTER TABLE child_a1 ENABLE TRIGGER USER")
+    conn.commit()
+
+    assert conn.execute("SELECT k FROM parent WHERE k = 'zebra'").fetchone() is not None
+    assert conn.execute("SELECT k FROM child_a1 WHERE k = 'zebra'").fetchone() is None
+    assert conn.execute("SELECT k FROM child_b WHERE k = 'zebra'").fetchone() is not None
+
+
+def test_repair_partition_table_operates_on_the_actual_leaf_not_the_intermediate(
+    two_level_db: psycopg.Connection,
+) -> None:
+    """Cycle 11's naming requirement: repair_partition_table() (and the
+    has_rule()/misplaced_rows() calls it drives) must operate on real
+    leaves (child_a1, child_a2, child_b), never the intermediate
+    sub-partitioned table (child_a) -- which holds no rows of its own
+    in this layout, so naming it instead would silently check nothing."""
+    conn = two_level_db
+    conn.execute("CREATE RULE no_op_insert AS ON INSERT TO child_a1 DO INSTEAD NOTHING")
+    conn.commit()
+
+    result = repair_partition_table(conn, "public", "parent", ["k"])
+
+    assert result.ok
+    assert result.skipped_ruled_children == ["child_a1"]
+    assert "child_a" not in result.skipped_ruled_children

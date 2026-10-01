@@ -53,6 +53,33 @@ def partition_children(conn: psycopg.Connection, schema: str, table: str) -> lis
     return [str(r[0]) for r in rows]
 
 
+def is_partitioned(conn: psycopg.Connection, schema: str, table: str) -> bool:
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_partitioned_table WHERE partrelid = %s::regclass)",
+        (f"{schema}.{table}",),
+    ).fetchone()
+    return bool(row is not None and row[0])
+
+
+def partition_leaves(conn: psycopg.Connection, schema: str, table: str) -> list[str]:
+    """Every actual data-holding leaf partition under `table`,
+    descending through any sub-partitioned (multi-level) children --
+    recursion stops at a relation that isn't itself partitioned.
+    `misplaced_rows()` needs no change to work correctly at any depth:
+    `pg_get_partition_constraintdef()` already reconstructs the full
+    constraint combined across every ancestor level, confirmed in the
+    PG16 docs ("Reconstructs the definition of a partition
+    constraint"), not just the immediate parent's bound.
+    """
+    leaves: list[str] = []
+    for child in partition_children(conn, schema, table):
+        if is_partitioned(conn, schema, child):
+            leaves.extend(partition_leaves(conn, schema, child))
+        else:
+            leaves.append(child)
+    return leaves
+
+
 def repair_partition_table(
     conn: psycopg.Connection,
     schema: str,
@@ -60,26 +87,32 @@ def repair_partition_table(
     key_columns: list[str],
     max_attempts: int = 100,
 ) -> PartitionRepairResult:
-    """Repair every misplaced row across every direct child of `table`,
-    looping until a full pass finds nothing left to fix or a safety cap
-    is hit. A capped loop rather than one pass: repairing a row moves
-    it to a *different* partition, which that partition's own next scan
-    will need to re-examine, and the project has no prior art to trust
-    that this always converges in one pass (see
-    docs/learnings/partition-repair-testing.md). A ruled child is
+    """Repair every misplaced row across every leaf partition under
+    `table` (descending through any sub-partitioned levels; see
+    partition_leaves()), looping until a full pass finds nothing left
+    to fix or a safety cap is hit. A capped loop rather than one pass:
+    repairing a row moves it to a *different* partition, which that
+    partition's own next scan will need to re-examine, and the project
+    has no prior art to trust that this always converges in one pass
+    (see docs/learnings/partition-repair-testing.md). A ruled leaf is
     skipped entirely (see has_rule()) and excluded from every pass, not
-    just logged once.
+    just logged once. repair_row() is always called with `table` as the
+    routing root, regardless of a leaf's actual depth -- cross-partition
+    UPDATE routing descends through the whole tree from wherever it's
+    targeted, so there's no need to route through an intermediate
+    sub-parent.
     """
-    children = [c for c in partition_children(conn, schema, table) if not has_rule(conn, schema, c)]
-    skipped = [c for c in partition_children(conn, schema, table) if has_rule(conn, schema, c)]
+    all_leaves = partition_leaves(conn, schema, table)
+    leaves = [c for c in all_leaves if not has_rule(conn, schema, c)]
+    skipped = [c for c in all_leaves if has_rule(conn, schema, c)]
     repaired = 0
 
     for _attempt in range(max_attempts):
         found_any = False
-        for child in children:
-            for ctid in misplaced_rows(conn, schema, child):
+        for leaf in leaves:
+            for ctid in misplaced_rows(conn, schema, leaf):
                 found_any = True
-                repair_row(conn, schema, table, child, key_columns, ctid)
+                repair_row(conn, schema, table, leaf, key_columns, ctid)
                 conn.commit()
                 repaired += 1
         if not found_any:
