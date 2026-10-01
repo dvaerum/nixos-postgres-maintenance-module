@@ -35,6 +35,25 @@ class Hook:
 
 
 @dataclass(frozen=True, slots=True)
+class PerDatabaseHooks:
+    pre_start: list[Hook] = field(default_factory=list)
+    on_success: list[Hook] = field(default_factory=list)
+    on_failure: list[Hook] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class HooksConfig:
+    """The fully-parsed shape of COLLATION_GUARD_HOOKS_FILE -- the
+    seven hook lists, with no asymmetry between them."""
+
+    pre_start: list[Hook] = field(default_factory=list)
+    on_success: list[Hook] = field(default_factory=list)
+    on_failure: list[Hook] = field(default_factory=list)
+    post_run: list[Hook] = field(default_factory=list)
+    per_database: PerDatabaseHooks = field(default_factory=PerDatabaseHooks)
+
+
+@dataclass(frozen=True, slots=True)
 class HookResult:
     ok: bool
     block_on_failure: bool
@@ -134,4 +153,47 @@ def run_hook(
         stdout=result.stdout,
         stderr=result.stderr,
         returncode=result.returncode,
+    )
+
+
+def _hook_from_dict(data: dict[str, object]) -> Hook:
+    environment = data.get("environment", {})
+    assert isinstance(environment, dict)
+    args = data.get("args", [])
+    assert isinstance(args, list)
+    environment_file = data.get("environmentFile")
+    return Hook(
+        path=str(data["path"]),
+        args=[str(a) for a in args],
+        environment={str(k): str(v) for k, v in environment.items()},
+        environment_file=str(environment_file) if environment_file is not None else None,
+        block_on_failure=bool(data["blockOnFailure"]),
+    )
+
+
+def _hook_list(raw: dict[str, object], key: str) -> list[Hook]:
+    entries = raw.get(key, [])
+    assert isinstance(entries, list)
+    return [_hook_from_dict(h) for h in entries]
+
+
+def load_hooks(path: str) -> HooksConfig:
+    """Parses COLLATION_GUARD_HOOKS_FILE (written by nixosModule/config.nix)
+    into a HooksConfig. Keys absent from the JSON entirely (not just
+    empty lists) default to empty -- the Nix side always writes all
+    seven, but this parser doesn't assume that."""
+    with open(path) as f:
+        raw: dict[str, object] = json.load(f)
+    per_db_raw_obj = raw.get("perDatabase", {})
+    assert isinstance(per_db_raw_obj, dict)
+    return HooksConfig(
+        pre_start=_hook_list(raw, "preStart"),
+        on_success=_hook_list(raw, "onSuccess"),
+        on_failure=_hook_list(raw, "onFailure"),
+        post_run=_hook_list(raw, "postRun"),
+        per_database=PerDatabaseHooks(
+            pre_start=_hook_list(per_db_raw_obj, "preStart"),
+            on_success=_hook_list(per_db_raw_obj, "onSuccess"),
+            on_failure=_hook_list(per_db_raw_obj, "onFailure"),
+        ),
     )

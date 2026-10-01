@@ -16,6 +16,7 @@ import pytest
 from collation_guard.hooks import (
     EnvironmentCollisionError,
     Hook,
+    load_hooks,
     merge_environment,
     parse_environment_file,
     run_hook,
@@ -158,3 +159,78 @@ def test_run_hook_failure_path_does_not_raise(tmp_path):
     assert result.returncode == 1
     assert "boom" in result.stderr
     assert result.block_on_failure is True
+
+
+def _hook_json(path: str = "/bin/true", block_on_failure: bool = True) -> dict:
+    return {
+        "path": path,
+        "args": ["--verbose"],
+        "environment": {"X": "1"},
+        "environmentFile": None,
+        "blockOnFailure": block_on_failure,
+    }
+
+
+def test_load_hooks_parses_all_seven_keys(tmp_path):
+    path = tmp_path / "hooks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "preStart": [_hook_json("/bin/pre-start")],
+                "onSuccess": [_hook_json("/bin/on-success")],
+                "onFailure": [_hook_json("/bin/on-failure")],
+                "postRun": [_hook_json("/bin/post-run")],
+                "perDatabase": {
+                    "preStart": [_hook_json("/bin/db-pre-start")],
+                    "onSuccess": [_hook_json("/bin/db-on-success")],
+                    "onFailure": [_hook_json("/bin/db-on-failure")],
+                },
+            }
+        )
+    )
+
+    hooks = load_hooks(str(path))
+
+    assert hooks.pre_start == [
+        Hook(
+            path="/bin/pre-start",
+            args=["--verbose"],
+            environment={"X": "1"},
+            block_on_failure=True,
+        )
+    ]
+    assert hooks.on_success[0].path == "/bin/on-success"
+    assert hooks.on_failure[0].path == "/bin/on-failure"
+    assert hooks.post_run[0].path == "/bin/post-run"
+    assert hooks.per_database.pre_start[0].path == "/bin/db-pre-start"
+    assert hooks.per_database.on_success[0].path == "/bin/db-on-success"
+    assert hooks.per_database.on_failure[0].path == "/bin/db-on-failure"
+
+
+def test_load_hooks_with_environment_file_and_missing_lists(tmp_path):
+    path = tmp_path / "hooks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "preStart": [
+                    {
+                        "path": "/bin/true",
+                        "args": [],
+                        "environment": {},
+                        "environmentFile": "/run/secrets/token",
+                        "blockOnFailure": False,
+                    }
+                ]
+            }
+        )
+    )
+
+    hooks = load_hooks(str(path))
+
+    assert hooks.pre_start[0].environment_file == "/run/secrets/token"
+    assert hooks.pre_start[0].block_on_failure is False
+    # keys absent from the JSON entirely (not just empty lists) default
+    # to empty -- the Nix side always writes all seven, but the parser
+    # itself shouldn't assume that.
+    assert hooks.on_success == []
+    assert hooks.per_database.on_failure == []
