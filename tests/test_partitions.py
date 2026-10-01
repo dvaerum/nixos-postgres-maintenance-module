@@ -354,3 +354,20 @@ def test_repair_partition_table_operates_on_the_actual_leaf_not_the_intermediate
     assert result.ok
     assert result.skipped_ruled_children == ["child_a1"]
     assert "child_a" not in result.skipped_ruled_children
+
+
+def test_partition_key_columns_resolves_single_column_key(
+    partitioned_db: psycopg.Connection,
+) -> None:
+    assert partitions.partition_key_columns(partitioned_db, "public", "parent") == ["k"]
+
+
+def test_partition_key_columns_resolves_composite_key_in_order(
+    test_db: psycopg.Connection,
+) -> None:
+    conn = test_db
+    conn.execute(
+        "CREATE TABLE composite (id serial, b text, a text) PARTITION BY RANGE (a, b)"
+    )
+    conn.commit()
+    assert partitions.partition_key_columns(conn, "public", "composite") == ["a", "b"]

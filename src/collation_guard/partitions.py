@@ -237,3 +237,26 @@ def partition_repair_candidates(conn: psycopg.Connection) -> list[tuple[str, str
         """
     ).fetchall()
     return [(str(r[0]), str(r[1])) for r in rows]
+
+
+def partition_key_columns(conn: psycopg.Connection, schema: str, table: str) -> list[str]:
+    """Column names making up `table`'s partition key, in key order --
+    `pg_partitioned_table.partattrs` stores attnums, not names, so this
+    resolves them against `pg_attribute`. Needed because
+    `partition_repair_candidates()` only returns table names;
+    `repair_partition_table()` needs the actual column(s) to self-assign
+    in its UPDATE."""
+    rows = conn.execute(
+        """
+        SELECT a.attname
+        FROM pg_partitioned_table pt
+        JOIN pg_class c ON c.oid = pt.partrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN unnest(pt.partattrs::int2[]) WITH ORDINALITY AS key(attnum, ord) ON true
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = key.attnum
+        WHERE n.nspname = %s AND c.relname = %s
+        ORDER BY key.ord
+        """,
+        (schema, table),
+    ).fetchall()
+    return [str(r[0]) for r in rows]

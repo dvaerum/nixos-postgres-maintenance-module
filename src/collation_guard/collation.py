@@ -146,22 +146,16 @@ def _safe_refresh(
         return None
 
 
-def process_database(conn: psycopg.Connection) -> DatabaseResult:
-    """Check and repair the connection's current database.
-
-    Reindexes every user table independently -- not one `REINDEX
-    DATABASE` call, which aborts entirely on the first bad index and
-    would leave every other, perfectly fixable table untouched (a real
-    production incident, see docs/decisions/0002). Only refreshes the
-    recorded collation version(s) once every table reindexed cleanly:
-    a partial failure means the database's content hasn't been fully
-    verified under the current collation, so its recorded version
-    should stay stale, not be marked current on a technicality.
+def reindex_all_user_tables(conn: psycopg.Connection) -> DatabaseResult:
+    """Reindex every user table in the connection's current database
+    independently -- not one `REINDEX DATABASE` call, which aborts
+    entirely on the first bad index and would leave every other,
+    perfectly fixable table untouched (a real production incident, see
+    docs/decisions/0002). Shared by process_database() (triggered by a
+    Postgres-tracked version mismatch) and the C.UTF-8 stamp path in
+    main.py (triggered unconditionally by a stale stamp, since Postgres
+    records no version for C/C.*/POSIX at all to check against).
     """
-    if not database_collation_is_stale(conn) and not stale_named_collations(conn):
-        return DatabaseResult()
-
-    stale_collations = stale_named_collations(conn)
     reindexed: list[str] = []
     failed: list[str] = []
 
@@ -181,6 +175,24 @@ def process_database(conn: psycopg.Connection) -> DatabaseResult:
         else:
             conn.commit()
             reindexed.append(table)
+
+    return DatabaseResult(reindexed=reindexed, failed=failed)
+
+
+def process_database(conn: psycopg.Connection) -> DatabaseResult:
+    """Check and repair the connection's current database's
+    Postgres-tracked collation versions. Only refreshes the recorded
+    version(s) once every table reindexed cleanly: a partial failure
+    means the database's content hasn't been fully verified under the
+    current collation, so its recorded version should stay stale, not
+    be marked current on a technicality.
+    """
+    if not database_collation_is_stale(conn) and not stale_named_collations(conn):
+        return DatabaseResult()
+
+    stale_collations = stale_named_collations(conn)
+    result = reindex_all_user_tables(conn)
+    reindexed, failed = result.reindexed, result.failed
 
     if not failed:
         refresh_error: str | None = None
