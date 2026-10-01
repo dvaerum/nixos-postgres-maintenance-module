@@ -31,6 +31,50 @@ def manager(pg_dsn: str, lockdown_conf_path: Path):
         lockdown_conf_path.unlink(missing_ok=True)
 
 
+def _can_connect(host: str, port: str, dbname: str, user: str) -> bool:
+    try:
+        with psycopg.connect(
+            f"host={host} port={port} dbname={dbname} user={user}", prepare_threshold=None
+        ):
+            return True
+    except psycopg.OperationalError:
+        return False
+
+
+def test_lock_two_databases_unlock_one_leaves_the_other_locked(
+    manager: LockdownManager, pg_dsn: str, admin_conn: psycopg.Connection
+) -> None:
+    host, port = _host_port(pg_dsn)
+    name_a, name_b = "cg_lockdown_test_dba", "cg_lockdown_test_dbb"
+    for name in (name_a, name_b):
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute(f'CREATE DATABASE "{name}"')
+    admin_conn.execute("DROP ROLE IF EXISTS cg_lockdown_test_role2")
+    admin_conn.execute("CREATE ROLE cg_lockdown_test_role2 LOGIN")
+    admin_conn.execute(f'GRANT CONNECT ON DATABASE "{name_a}" TO cg_lockdown_test_role2')
+    admin_conn.execute(f'GRANT CONNECT ON DATABASE "{name_b}" TO cg_lockdown_test_role2')
+    admin_conn.execute("GRANT CONNECT ON DATABASE postgres TO cg_lockdown_test_role2")
+    try:
+        manager.lock(name_a)
+        manager.lock(name_b)
+        assert not _can_connect(host, port, name_a, "cg_lockdown_test_role2")
+        assert not _can_connect(host, port, name_b, "cg_lockdown_test_role2")
+        # unrelated databases are never touched by the lockdown file
+        assert _can_connect(host, port, "postgres", "cg_lockdown_test_role2")
+
+        manager.unlock(name_a)
+        assert _can_connect(host, port, name_a, "cg_lockdown_test_role2")
+        assert not _can_connect(host, port, name_b, "cg_lockdown_test_role2")
+
+        manager.unlock(name_b)
+        assert _can_connect(host, port, name_b, "cg_lockdown_test_role2")
+    finally:
+        admin_conn.execute("REVOKE CONNECT ON DATABASE postgres FROM cg_lockdown_test_role2")
+        for name in (name_a, name_b):
+            admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute("DROP ROLE IF EXISTS cg_lockdown_test_role2")
+
+
 def test_lock_then_unlock_a_single_database(
     manager: LockdownManager, pg_dsn: str, admin_conn: psycopg.Connection
 ) -> None:
