@@ -525,6 +525,194 @@ def test_run_on_failure_blocking_hook_failure_makes_the_process_exit_nonzero(tmp
     assert exit_code == 1
 
 
+def _context_dump_hook(out_path, *, block_on_failure: bool = False) -> Hook:
+    """A hook that dumps its own COLLATION_GUARD_CONTEXT verbatim --
+    proves run_hook() actually receives it, not just that main.py built
+    a dict somewhere."""
+    script = "import os, sys; open(sys.argv[1], 'w').write(os.environ['COLLATION_GUARD_CONTEXT'])"
+    return Hook(
+        path=sys.executable, args=["-c", script, str(out_path)], block_on_failure=block_on_failure
+    )
+
+
+def test_run_prestart_context_is_the_empty_report_shape(pg_dsn: str, tmp_path) -> None:
+    host, port = _host_port(pg_dsn)
+    out = tmp_path / "context.json"
+
+    main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(pre_start=[_context_dump_hook(out)]),
+    )
+
+    assert json.loads(out.read_text()) == {
+        "databases_processed": [],
+        "databases_repaired": [],
+        "failures": [],
+        "success": True,
+    }
+
+
+def test_run_onsuccess_context_reflects_the_completed_run(pg_dsn: str, tmp_path) -> None:
+    host, port = _host_port(pg_dsn)
+    out = tmp_path / "context.json"
+
+    main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(on_success=[_context_dump_hook(out)]),
+    )
+
+    context = json.loads(out.read_text())
+    assert "postgres" in context["databases_processed"]
+    assert context["failures"] == []
+    assert context["success"] is True
+
+
+def test_run_postrun_context_reflects_failures_when_the_run_failed(
+    pg_dsn: str, failing_database: str, tmp_path
+) -> None:
+    host, port = _host_port(pg_dsn)
+    out = tmp_path / "context.json"
+
+    main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(post_run=[_context_dump_hook(out)]),
+    )
+
+    context = json.loads(out.read_text())
+    assert context["success"] is False
+    assert any(f["database"] == failing_database for f in context["failures"])
+
+
+def test_run_per_database_prestart_context_is_empty(pg_dsn: str, tmp_path) -> None:
+    host, port = _host_port(pg_dsn)
+    out = tmp_path / "context.json"
+
+    main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(pre_start=[_context_dump_hook(out)])),
+    )
+
+    assert json.loads(out.read_text()) == {}
+
+
+def test_run_per_database_success_context_lists_reindexed_relations(
+    pg_dsn: str, admin_conn: psycopg.Connection, tmp_path
+) -> None:
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_context_success"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(
+        f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
+        f"TEMPLATE template0"
+    )
+    out = tmp_path / "context.json"
+    try:
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name}", prepare_threshold=None
+        ) as conn:
+            conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, label text)")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+                "WHERE datname = current_database()"
+            )
+            conn.commit()
+
+        main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-locales",
+            partition_repair_enabled=True,
+            max_repair_attempts=10,
+            hooks=HooksConfig(per_database=PerDatabaseHooks(on_success=[_context_dump_hook(out)])),
+        )
+
+        contexts = []
+        if out.exists():
+            contexts.append(json.loads(out.read_text()))
+        assert any(c.get("reindexed") == ["widgets"] for c in contexts)
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_run_per_database_failure_context_lists_the_failed_relation(
+    pg_dsn: str, failing_database: str, tmp_path
+) -> None:
+    host, port = _host_port(pg_dsn)
+    out = tmp_path / "context.json"
+
+    main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(on_failure=[_context_dump_hook(out)])),
+    )
+
+    assert json.loads(out.read_text()) == {
+        "failures": [{"relation": "widgets", "error": "REINDEX failed"}]
+    }
+
+
+def test_run_on_failure_context_is_the_recovered_report_shape(tmp_path) -> None:
+    context_file = tmp_path / "context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "databases_processed": ["postgres"],
+                "databases_repaired": [],
+                "failures": [{"database": "mydb", "relation": "widgets", "error": "boom"}],
+                "success": False,
+            }
+        )
+    )
+    out = tmp_path / "recorded-context.json"
+    hooks_file = _hooks_file_with_one_on_failure_hook(
+        tmp_path,
+        sys.executable,
+        "-c",
+        "import os, sys; open(sys.argv[1], 'w').write(os.environ['COLLATION_GUARD_CONTEXT'])",
+        str(out),
+    )
+
+    main.run_on_failure(hooks_file, str(context_file))
+
+    assert json.loads(out.read_text())["databases_processed"] == ["postgres"]
+
+
+def test_run_on_failure_context_falls_back_to_empty_dict_with_no_context_file(tmp_path) -> None:
+    missing_context_file = tmp_path / "does-not-exist.json"
+    out = tmp_path / "recorded-context.json"
+    hooks_file = _hooks_file_with_one_on_failure_hook(
+        tmp_path,
+        sys.executable,
+        "-c",
+        "import os, sys; open(sys.argv[1], 'w').write(os.environ['COLLATION_GUARD_CONTEXT'])",
+        str(out),
+    )
+
+    main.run_on_failure(hooks_file, str(missing_context_file))
+
+    assert json.loads(out.read_text()) == {}
+
+
 def test_run_processes_many_databases_correctly_under_real_concurrency(
     pg_dsn: str, admin_conn: psycopg.Connection
 ) -> None:

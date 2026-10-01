@@ -47,6 +47,19 @@ def _summarize_failures(report: RunReport) -> str:
     return "; ".join(f"{f.database}.{f.relation}: {f.error}" for f in report.failures)
 
 
+def _report_context(report: RunReport) -> dict[str, object]:
+    """The RunReport-shape dict exposed as COLLATION_GUARD_CONTEXT on
+    every global hook stage, and written to COLLATION_GUARD_CONTEXT_FILE
+    -- one definition, shared by both, so the shape can't drift between
+    the two."""
+    return {
+        "databases_processed": report.databases_processed,
+        "databases_repaired": sorted(set(report.databases_repaired)),
+        "failures": [asdict(f) for f in report.failures],
+        "success": report.success,
+    }
+
+
 def _connect(host: str, port: str, dbname: str) -> psycopg.Connection:
     return psycopg.connect(f"host={host} port={port} dbname={dbname}", prepare_threshold=None)
 
@@ -101,7 +114,7 @@ def _process_database(
     report = RunReport()
 
     if not _run_hooks(
-        hooks.per_database.pre_start, "database_pre_start", report, database=dbname
+        hooks.per_database.pre_start, "database_pre_start", report, database=dbname, context={}
     ):
         # blockOnFailure=true: skip this database entirely -- no
         # process_database, no partition repair, not added to
@@ -137,7 +150,11 @@ def _process_database(
     new_failures = report.failures[failures_before:]
     if not new_failures:
         _run_hooks(
-            hooks.per_database.on_success, "database_success", report, database=dbname
+            hooks.per_database.on_success,
+            "database_success",
+            report,
+            database=dbname,
+            context={"reindexed": result.reindexed},
         )
     else:
         error = "; ".join(f"{f.relation}: {f.error}" for f in new_failures)
@@ -147,6 +164,9 @@ def _process_database(
             report,
             database=dbname,
             error=error,
+            context={
+                "failures": [{"relation": f.relation, "error": f.error} for f in new_failures]
+            },
         )
 
     return report
@@ -243,7 +263,9 @@ def run(
     report = RunReport()
     hooks = hooks or HooksConfig()
 
-    if not dry_run and not _run_hooks(hooks.pre_start, "pre_start", report):
+    if not dry_run and not _run_hooks(
+        hooks.pre_start, "pre_start", report, context=_report_context(report)
+    ):
         return report
 
     with _connect(host, port, "postgres") as admin_conn:
@@ -292,26 +314,30 @@ def run(
     report.databases_repaired.sort()
 
     if report.success:
-        _run_hooks(hooks.on_success, "on_success", report)
+        _run_hooks(hooks.on_success, "on_success", report, context=_report_context(report))
 
     # postRun fires regardless of outcome -- unlike onSuccess, which is
     # deliberately gated on a clean run.
     post_run_error = None if report.success else _summarize_failures(report)
-    _run_hooks(hooks.post_run, "post_run", report, error=post_run_error)
+    _run_hooks(
+        hooks.post_run, "post_run", report, context=_report_context(report), error=post_run_error
+    )
 
     return report
 
 
-def _recover_last_context(context_file: str) -> tuple[dict[str, object] | None, str]:
+def _recover_last_context(context_file: str) -> tuple[dict[str, object], str]:
     """Reads the context file the previous run wrote (if any) to
     recover what failed. A missing or unreadable file -- e.g. a crash
     on the very first-ever run, before anything was ever written --
-    falls back to a generic message rather than raising."""
+    falls back to a generic message and an empty dict (not None, for
+    the same "COLLATION_GUARD_CONTEXT is always valid JSON" guarantee
+    every other stage gives) rather than raising."""
     try:
         with open(context_file) as f:
             data: dict[str, object] = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return None, "collation-guard failed or crashed (no prior run context available)"
+        return {}, "collation-guard failed or crashed (no prior run context available)"
 
     failures = data.get("failures", [])
     assert isinstance(failures, list)
@@ -335,21 +361,14 @@ def run_on_failure(hooks_file: str, context_file: str) -> int:
     return 0 if report.success else 1
 
 
+
 def _write_context_file(path: str, report: RunReport) -> None:
     # Best-effort: a hook-context write failure is a hook-delivery
     # problem, not evidence the guard itself failed -- the exit code
     # below is still driven entirely by report.success, not by this.
     try:
         with open(path, "w") as f:
-            json.dump(
-                {
-                    "databases_processed": report.databases_processed,
-                    "databases_repaired": sorted(set(report.databases_repaired)),
-                    "failures": [asdict(f) for f in report.failures],
-                    "success": report.success,
-                },
-                f,
-            )
+            json.dump(_report_context(report), f)
     except OSError:
         logger.warning("could not write context file %s", path, exc_info=True)
 
