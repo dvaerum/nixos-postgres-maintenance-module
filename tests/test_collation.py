@@ -96,3 +96,54 @@ def test_process_database_is_idempotent_after_refresh(pg_dsn: str, test_db: str)
         assert second.ok
         assert second.reindexed == []
         assert second.failed == []
+
+
+def test_process_database_reindex_failure_is_isolated_per_relation(
+    pg_dsn: str, test_db: str
+) -> None:
+    """One table with an unrepairable duplicate key must not block
+    reindexing every other, perfectly fixable table in the same
+    database -- the real-world gap this design corrects for (REINDEX
+    DATABASE aborts entirely on the first bad index; see
+    docs/decisions/0002). Regression test for cycle 4."""
+    with _connect(pg_dsn, test_db) as conn:
+        conn.execute("CREATE TABLE good_table (id serial PRIMARY KEY, name text)")
+        conn.execute("INSERT INTO good_table (name) VALUES ('alpha'), ('beta')")
+
+        conn.execute("CREATE TABLE bad_table (id serial PRIMARY KEY, name text UNIQUE)")
+        conn.execute("INSERT INTO bad_table (name) VALUES ('alpha')")
+        conn.commit()
+
+        # Inject a duplicate that bypasses the unique index: mark it
+        # "not ready" so DML stops maintaining it, insert the
+        # conflicting row, then mark it ready again without rebuilding
+        # it -- the index now silently disagrees with the heap. REINDEX
+        # has to rescan the heap from scratch, so it's the first thing
+        # that actually notices. Same technique already proven live
+        # against the real production cluster.
+        conn.execute(
+            "UPDATE pg_index SET indisready = false "
+            "WHERE indexrelid = 'bad_table_name_key'::regclass"
+        )
+        conn.commit()
+        conn.execute("INSERT INTO bad_table (name) VALUES ('alpha')")
+        conn.commit()
+        conn.execute(
+            "UPDATE pg_index SET indisready = true "
+            "WHERE indexrelid = 'bad_table_name_key'::regclass"
+        )
+        conn.commit()
+
+        _fake_stale(conn, test_db)
+        conn.commit()
+
+        result = process_database(conn)
+
+        assert not result.ok
+        assert result.reindexed == ["good_table"]
+        assert result.failed == ["bad_table"]
+        # A partial failure means the database's content hasn't been
+        # fully verified under the current collation -- its recorded
+        # version must stay stale, not get marked current on a
+        # technicality.
+        assert database_collation_is_stale(conn)
