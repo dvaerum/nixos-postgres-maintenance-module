@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "collation-guard"
+version = "0.1.0"
+description = "Postgres collation-drift guard for NixOS: per-relation reindex, C.UTF-8 stamping, and text-partition repair"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+  "psycopg>=3.3",
+]
+
+[project.scripts]
+collation-guard = "collation_guard.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/collation_guard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["src"]
+
+[tool.mypy]
+strict = true
+mypy_path = "src"
+files = ["src/collation_guard"]
+
+[[tool.mypy.overrides]]
+module = "psycopg.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
