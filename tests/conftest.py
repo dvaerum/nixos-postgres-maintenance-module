@@ -35,7 +35,11 @@ def _wait_until_ready(dsn: str, timeout: float = 10.0) -> None:
 
 
 def _start_cluster(
-    tmp_path_factory: pytest.TempPathFactory, label: str, locale: str, port: int
+    tmp_path_factory: pytest.TempPathFactory,
+    label: str,
+    locale: str,
+    port: int,
+    lockdown_conf_path: Path,
 ) -> Iterator[str]:
     data_dir: Path = tmp_path_factory.mktemp(f"pgdata-{label}")
     socket_dir: Path = tmp_path_factory.mktemp(f"pgsocket-{label}")
@@ -54,6 +58,13 @@ def _start_cluster(
         capture_output=True,
         text=True,
     )
+
+    # Mirrors the include_if_exists line the real NixOS module installs
+    # ahead of every other rule (lib.mkBefore) -- the file doesn't exist
+    # yet, so this is a no-op until a test actually writes to it via
+    # LockdownManager.
+    hba_path = data_dir / "pg_hba.conf"
+    hba_path.write_text(f"include_if_exists {lockdown_conf_path}\n{hba_path.read_text()}")
 
     subprocess.run(
         [
@@ -84,7 +95,19 @@ def _start_cluster(
 
 
 @pytest.fixture(scope="session")
-def pg_dsn(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def lockdown_conf_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Where the main test cluster's pg_hba.conf expects a
+    LockdownManager-written file -- mirrors the path the real NixOS
+    module points include_if_exists at in production. Session-scoped,
+    same lifetime as pg_dsn's cluster; the file itself need not exist
+    (include_if_exists tolerates that)."""
+    return tmp_path_factory.mktemp("lockdown") / "lockdown.conf"
+
+
+@pytest.fixture(scope="session")
+def pg_dsn(
+    tmp_path_factory: pytest.TempPathFactory, lockdown_conf_path: Path
+) -> Iterator[str]:
     """The main test cluster. Initialized with a real libc locale, not
     C: template0 and `postgres` must carry a real, non-NULL
     datcollversion to exercise the Postgres-tracked mismatch path at
@@ -92,11 +115,13 @@ def pg_dsn(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     transition where recorded vs. actual versions disagree on
     NULL-ness (confirmed in PG16's dbcommands.c), which a C-locale
     cluster can never satisfy."""
-    yield from _start_cluster(tmp_path_factory, "main", "en_US.UTF-8", _PORT)
+    yield from _start_cluster(tmp_path_factory, "main", "en_US.UTF-8", _PORT, lockdown_conf_path)
 
 
 @pytest.fixture(scope="session")
-def c_locale_pg_dsn(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def c_locale_pg_dsn(
+    tmp_path_factory: pytest.TempPathFactory, lockdown_conf_path: Path
+) -> Iterator[str]:
     """A second, separate C-locale cluster -- needed only to reproduce
     the 'invalid collation version change' defensive-handling path.
     Once template0 itself carries a real (non-NULL) version, Postgres
@@ -105,7 +130,9 @@ def c_locale_pg_dsn(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     version, but no actual collation version could be determined"), so
     that failure mode can only be reproduced via template0 in a
     cluster whose default locale is C from the start."""
-    yield from _start_cluster(tmp_path_factory, "c-locale", "C", _PORT + 1)
+    yield from _start_cluster(
+        tmp_path_factory, "c-locale", "C", _PORT + 1, tmp_path_factory.mktemp("lockdown-c") / "x"
+    )
 
 
 @pytest.fixture
