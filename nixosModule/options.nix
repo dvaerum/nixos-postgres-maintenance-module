@@ -23,7 +23,7 @@ in
           Also check text-keyed, non-`C`/`POSIX`-collated partition bounds
           and repair any row that's drifted into the wrong physical
           partition under the new collation. See
-          docs/decisions/0004-detach-attach-partition-repair.md.
+          docs/decisions/0004-cross-partition-update-for-partition-repair.md.
         '';
       };
 
@@ -31,7 +31,7 @@ in
         type = types.ints.positive;
         default = 1000;
         description = ''
-          Safety cap on the detach/fix/attach retry loop per partitioned
+          Safety cap on the per-row repair retry loop per partitioned
           table, so a pathological number of misplaced rows fails loudly
           instead of spinning forever.
         '';
