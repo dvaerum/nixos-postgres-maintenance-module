@@ -135,6 +135,21 @@ collation-guard --dry-run # list partition-repair candidates across the cluster,
 See `docs/decisions/` for the full reasoning behind each piece, and
 `docs/learnings/` for other non-obvious findings from building this.
 
+## Future work
+
+- **Blocking external (non-systemd-managed) clients during the run.**
+  `postgresql-setup.service`/`postgresql.target` and anything ordered
+  after them on *this* host correctly wait for the guard, but a client
+  connecting from somewhere else entirely -- another host on the
+  network, anything outside this host's own systemd dependency graph --
+  has no reason to wait and can connect while the guard is still
+  reindexing or mid-repair, against inconsistent state. Not designed or
+  implemented yet; no clear mechanism chosen (candidates to look into:
+  temporarily tightening `pg_hba.conf`, a connection-limiting setting,
+  or some way to advertise "still under maintenance" that external
+  tooling could check) -- flagged here as a real gap worth solving, not
+  solved.
+
 ## Development
 
 ```
