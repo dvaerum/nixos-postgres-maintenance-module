@@ -20,7 +20,8 @@ jobs:
       - uses: cachix/install-nix-action@v27
         with:
           extra_nix_config: |
-            experimental-features = nix-command flakes
+            experimental-features = nix-command flakes auto-allocate-uids cgroups
+            auto-allocate-uids = true
 
       - name: nix flake update
         run: nix flake update
