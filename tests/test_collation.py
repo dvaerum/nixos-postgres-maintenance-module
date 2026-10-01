@@ -17,6 +17,7 @@ from collation_guard.collation import (
     connectable_databases,
     database_collation_is_stale,
     glibc_stamp,
+    is_database_stale,
     process_database,
     process_template0,
     set_glibc_stamp,
@@ -56,6 +57,33 @@ def _connect(pg_dsn: str, dbname: str) -> psycopg.Connection:
     parts = dict(item.split("=", 1) for item in pg_dsn.split())
     dsn = f"host={parts['host']} port={parts['port']} dbname={dbname}"
     return psycopg.connect(dsn, prepare_threshold=None)
+
+
+def test_is_database_stale_false_when_nothing_tracked_is_stale(pg_dsn: str, test_db: str) -> None:
+    with _connect(pg_dsn, test_db) as conn:
+        assert not is_database_stale(conn)
+
+
+def test_is_database_stale_true_when_default_collation_is_stale(pg_dsn: str, test_db: str) -> None:
+    with _connect(pg_dsn, test_db) as conn:
+        _fake_stale(conn, test_db)
+        conn.commit()
+        assert database_collation_is_stale(conn)
+        assert is_database_stale(conn)
+
+
+def test_is_database_stale_true_when_a_named_collation_is_stale(pg_dsn: str, test_db: str) -> None:
+    with _connect(pg_dsn, test_db) as conn:
+        conn.execute("CREATE COLLATION cg_test_collation (locale = 'en_US.UTF-8')")
+        conn.commit()
+        conn.execute(
+            "UPDATE pg_collation SET collversion = 'not-the-real-version' "
+            "WHERE collname = 'cg_test_collation'"
+        )
+        conn.commit()
+
+        assert not database_collation_is_stale(conn)
+        assert is_database_stale(conn)
 
 
 def test_process_database_is_noop_when_not_stale(pg_dsn: str, test_db: str) -> None:

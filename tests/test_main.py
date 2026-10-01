@@ -12,7 +12,7 @@ from collections.abc import Iterator
 import psycopg
 import pytest
 
-from collation_guard import main
+from collation_guard import main, partitions
 from collation_guard.hooks import Hook, HooksConfig, PerDatabaseHooks
 
 
@@ -138,6 +138,71 @@ def test_run_fixes_a_genuine_postgres_tracked_mismatch(
 
         assert report.success
         assert name in report.databases_repaired
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_run_records_a_database_repaired_only_once_across_collation_and_partition_fixes(
+    pg_dsn: str, admin_conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database can be repaired twice in one run -- once for a stale
+    named collation, once for a partition fix -- but
+    report.databases_repaired must record it only once (see
+    _mark_repaired in main.py)."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_double_repair"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(
+        f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
+        f"TEMPLATE template0"
+    )
+    try:
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name}", prepare_threshold=None
+        ) as conn:
+            conn.execute("CREATE COLLATION cg_double_repair_collation (locale = 'en_US.UTF-8')")
+            conn.execute("CREATE TABLE parent (id serial, k text) PARTITION BY RANGE (k)")
+            conn.execute(
+                "CREATE TABLE child_a PARTITION OF parent FOR VALUES FROM (MINVALUE) TO ('m')"
+            )
+            conn.execute(
+                "CREATE TABLE child_b PARTITION OF parent FOR VALUES FROM ('m') TO (MAXVALUE)"
+            )
+            conn.execute("INSERT INTO parent (k) VALUES ('apple')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_collation SET collversion = 'not-the-real-version' "
+                "WHERE collname = 'cg_double_repair_collation'"
+            )
+            conn.commit()
+
+        # Simulate one misplaced row being found and repaired -- a
+        # *genuinely* misplaced row can't be constructed in this
+        # single-locale fast tier (same constraint documented in
+        # tests/test_partitions.py above partitioned_db); the real
+        # multi-build drift is covered by tests/nixos/icu-drift.nix.
+        call_state = {"done": False}
+        real_misplaced_rows = partitions.misplaced_rows
+
+        def fake_misplaced_rows(conn: psycopg.Connection, schema: str, child: str) -> list[object]:
+            if not call_state["done"] and child == "child_a":
+                call_state["done"] = True
+                (ctid,) = conn.execute("SELECT ctid FROM child_a WHERE k = 'apple'").fetchone()
+                return [ctid]
+            return real_misplaced_rows(conn, schema, child)
+
+        monkeypatch.setattr(partitions, "misplaced_rows", fake_misplaced_rows)
+
+        report = main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-locales",
+            partition_repair_enabled=True,
+            max_repair_attempts=10,
+        )
+
+        assert report.success
+        assert report.databases_repaired.count(name) == 1
     finally:
         admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
@@ -1020,3 +1085,25 @@ def test_run_processes_many_databases_correctly_under_real_concurrency(
     finally:
         for name in all_names:
             admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_main_passes_max_parallel_databases_env_var_to_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> main.RunReport:
+        captured.update(kwargs)
+        return main.RunReport()
+
+    monkeypatch.setattr(main, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["collation-guard"])
+    monkeypatch.setenv("PGHOST", "x")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("GLIBC_LOCALES_PATH", "/nix/store/x")
+    monkeypatch.setenv("COLLATION_GUARD_PARTITION_REPAIR_ENABLE", "true")
+    monkeypatch.setenv("COLLATION_GUARD_MAX_REPAIR_ATTEMPTS", "100")
+    monkeypatch.setenv("COLLATION_GUARD_MAX_PARALLEL_DATABASES", "7")
+
+    assert main.main() == 0
+    assert captured["max_parallel_databases"] == 7

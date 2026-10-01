@@ -66,6 +66,15 @@ def stale_named_collations(conn: psycopg.Connection) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
+def is_database_stale(conn: psycopg.Connection) -> bool:
+    """True if this database has any Postgres-tracked collation work
+    outstanding -- its own default collation or any named collation.
+    The one shared predicate both process_database()'s own gate and
+    main.py's lock decision call, so they can't drift apart (see
+    docs/decisions/0007)."""
+    return database_collation_is_stale(conn) or bool(stale_named_collations(conn))
+
+
 def user_tables(conn: psycopg.Connection) -> list[tuple[str, str]]:
     """(schema, table) for every ordinary user table -- excludes the
     system catalogs, which `REINDEX DATABASE` itself also never touches
@@ -203,7 +212,7 @@ def process_database(conn: psycopg.Connection) -> DatabaseResult:
     current collation, so its recorded version should stay stale, not
     be marked current on a technicality.
     """
-    if not database_collation_is_stale(conn) and not stale_named_collations(conn):
+    if not is_database_stale(conn):
         return DatabaseResult()
 
     stale_collations = stale_named_collations(conn)

@@ -14,6 +14,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
+from collation_guard import lockdown
 from collation_guard.lockdown import LockdownManager, _LockRequest
 
 
@@ -178,6 +179,23 @@ def test_lock_terminates_existing_sessions_but_excludes_the_guards_own(
     finally:
         manager.unlock(name)
         admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_lock_raises_instead_of_hanging_when_reload_confirmation_fails(
+    manager: LockdownManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        lockdown,
+        "_reload_and_confirm",
+        lambda conn: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    request = _LockRequest("some_db", "lock")
+    manager._queue.put(request)
+    assert request.done.wait(timeout=5), "manager thread hung instead of signaling failure"
+
+    # poisoned: a later request fails fast, doesn't touch the dead thread
+    with pytest.raises(RuntimeError):
+        manager.lock("another_db")
 
 
 def test_lock_then_unlock_a_single_database(

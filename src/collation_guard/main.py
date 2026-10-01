@@ -10,7 +10,9 @@ import argparse
 import json
 import logging
 import os
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 
 import psycopg
@@ -54,10 +56,18 @@ def _report_context(report: RunReport) -> dict[str, object]:
     the two."""
     return {
         "databases_processed": report.databases_processed,
-        "databases_repaired": sorted(set(report.databases_repaired)),
+        "databases_repaired": sorted(report.databases_repaired),
         "failures": [asdict(f) for f in report.failures],
         "success": report.success,
     }
+
+
+def _mark_repaired(report: RunReport, dbname: str) -> None:
+    """The same database can be repaired twice in one run (a collation
+    reindex and a partition repair) -- dedup at the one place duplicates
+    are created, rather than at every reader of databases_repaired."""
+    if dbname not in report.databases_repaired:
+        report.databases_repaired.append(dbname)
 
 
 def _connect(host: str, port: str, dbname: str) -> psycopg.Connection:
@@ -67,9 +77,49 @@ def _connect(host: str, port: str, dbname: str) -> psycopg.Connection:
     )
 
 
-def _repair_partitions_in(
+@contextmanager
+def _locked_connection(
+    host: str,
+    port: str,
+    dbname: str,
+    manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
+    needs_lock: Callable[[psycopg.Connection], bool],
+) -> Iterator[psycopg.Connection]:
+    with _connect(host, port, dbname) as conn:
+        locked = needs_lock(conn)
+        if locked:
+            manager.lock(dbname)
+        try:
+            yield conn
+        finally:
+            if locked:
+                manager.unlock(dbname)
+
+
+def _apply_collation_result(
+    result: collation.DatabaseResult, dbname: str, report: RunReport
+) -> bool:
+    if result.reindexed:
+        logger.info(
+            "%s: reindexed %d table(s) for a Postgres-tracked collation mismatch: %s",
+            dbname,
+            len(result.reindexed),
+            ", ".join(result.reindexed),
+        )
+        _mark_repaired(report, dbname)
+    for table in result.failed:
+        report.failures.append(Failure(database=dbname, relation=table, error="REINDEX failed"))
+    if result.refresh_error is not None:
+        report.failures.append(
+            Failure(database=dbname, relation=dbname, error=result.refresh_error)
+        )
+    return result.ok
+
+
+def _apply_partition_repair(
     conn: psycopg.Connection, dbname: str, max_attempts: int, report: RunReport
-) -> None:
+) -> bool:
+    ok = True
     for schema, table in partitions.partition_repair_candidates(conn):
         key_columns = partitions.partition_key_columns(conn, schema, table)
         result = partitions.repair_partition_table(conn, schema, table, key_columns, max_attempts)
@@ -81,7 +131,7 @@ def _repair_partitions_in(
                 table,
                 result.repaired,
             )
-            report.databases_repaired.append(dbname)
+            _mark_repaired(report, dbname)
         for child in result.skipped_ruled_children:
             logger.warning(
                 "partition repair: %s.%s.%s has a RULE attached -- skipping, no automated "
@@ -91,6 +141,7 @@ def _repair_partitions_in(
                 child,
             )
         if not result.ok:
+            ok = False
             report.failures.append(
                 Failure(
                     database=dbname,
@@ -98,6 +149,7 @@ def _repair_partitions_in(
                     error=f"partition repair gave up after {max_attempts} attempts",
                 )
             )
+    return ok
 
 
 def _process_database(
@@ -125,60 +177,36 @@ def _process_database(
         # databases_processed. Other databases are unaffected.
         return report
 
-    failures_before = len(report.failures)
-
-    with _connect(host, port, dbname) as conn:
+    def needs_lock(conn: psycopg.Connection) -> bool:
         # Cheap, read-only checks decide whether this database needs
         # locking at all -- a database with nothing to fix is never
         # locked (no lock()/unlock() call, no entry in the lockdown
         # file), matching this project's own existing detection logic
         # rather than inventing a new one.
-        needs_lock = collation.database_collation_is_stale(conn) or bool(
-            collation.stale_named_collations(conn)
-        )
+        locked = collation.is_database_stale(conn)
         if partition_repair_enabled:
-            needs_lock = needs_lock or bool(partitions.partition_repair_candidates(conn))
+            locked = locked or bool(partitions.partition_repair_candidates(conn))
+        return locked
 
-        if needs_lock:
-            manager.lock(dbname)
-        try:
-            result = collation.process_database(conn)
-            if result.reindexed:
-                logger.info(
-                    "%s: reindexed %d table(s) for a Postgres-tracked collation mismatch: %s",
-                    dbname,
-                    len(result.reindexed),
-                    ", ".join(result.reindexed),
-                )
-                report.databases_repaired.append(dbname)
-            for table in result.failed:
-                report.failures.append(
-                    Failure(database=dbname, relation=table, error="REINDEX failed")
-                )
-            if result.refresh_error is not None:
-                report.failures.append(
-                    Failure(database=dbname, relation=dbname, error=result.refresh_error)
-                )
-
-            if partition_repair_enabled:
-                _repair_partitions_in(conn, dbname, max_attempts, report)
-        finally:
-            if needs_lock:
-                manager.unlock(dbname)
+    with _locked_connection(host, port, dbname, manager, needs_lock) as conn:
+        collation_result = collation.process_database(conn)
+        collation_ok = _apply_collation_result(collation_result, dbname, report)
+        partition_ok = True
+        if partition_repair_enabled:
+            partition_ok = _apply_partition_repair(conn, dbname, max_attempts, report)
 
     report.databases_processed.append(dbname)
 
-    new_failures = report.failures[failures_before:]
-    if not new_failures:
+    if collation_ok and partition_ok:
         _run_hooks(
             hooks.per_database.on_success,
             "database_success",
             report,
             database=dbname,
-            context={"reindexed": result.reindexed},
+            context={"reindexed": collation_result.reindexed},
         )
     else:
-        error = "; ".join(f"{f.relation}: {f.error}" for f in new_failures)
+        error = "; ".join(f"{f.relation}: {f.error}" for f in report.failures)
         _run_hooks(
             hooks.per_database.on_failure,
             "database_failure",
@@ -186,7 +214,7 @@ def _process_database(
             database=dbname,
             error=error,
             context={
-                "failures": [{"relation": f.relation, "error": f.error} for f in new_failures]
+                "failures": [{"relation": f.relation, "error": f.error} for f in report.failures]
             },
         )
 
@@ -231,23 +259,19 @@ def _process_glibc_stamp(
             # (Postgres never versions C/C.*/POSIX at all) -- once the
             # stamp itself is stale, every member of c_utf8_dbs
             # genuinely gets reindexed.
-            with _connect(host, port, dbname) as conn:
-                manager.lock(dbname)
-                try:
-                    result = collation.reindex_all_user_tables(conn)
-                    if result.reindexed:
-                        report.databases_repaired.append(dbname)
-                    for table in result.failed:
-                        all_ok = False
-                        report.failures.append(
-                            Failure(
-                                database=dbname,
-                                relation=table,
-                                error="REINDEX failed (C.UTF-8 stamp check)",
-                            )
+            with _locked_connection(host, port, dbname, manager, lambda _conn: True) as conn:
+                result = collation.reindex_all_user_tables(conn)
+                if result.reindexed:
+                    _mark_repaired(report, dbname)
+                for table in result.failed:
+                    all_ok = False
+                    report.failures.append(
+                        Failure(
+                            database=dbname,
+                            relation=table,
+                            error="REINDEX failed (C.UTF-8 stamp check)",
                         )
-                finally:
-                    manager.unlock(dbname)
+                    )
 
         # Only advance the stamp once every C.UTF-8 database reindexed
         # cleanly -- otherwise the next run must retry, not silently skip.
@@ -492,6 +516,7 @@ def main() -> int:
         glibc_locales_path=os.environ["GLIBC_LOCALES_PATH"],
         partition_repair_enabled=os.environ["COLLATION_GUARD_PARTITION_REPAIR_ENABLE"] == "true",
         max_repair_attempts=int(os.environ["COLLATION_GUARD_MAX_REPAIR_ATTEMPTS"]),
+        max_parallel_databases=int(os.environ.get("COLLATION_GUARD_MAX_PARALLEL_DATABASES", "4")),
         hooks=hooks,
         dry_run=args.dry_run,
         lockdown_path=os.environ.get("COLLATION_GUARD_LOCKDOWN_FILE"),
@@ -511,7 +536,7 @@ def main() -> int:
         logger.info(
             "ok -- %d database(s) processed, %d repaired",
             len(report.databases_processed),
-            len(set(report.databases_repaired)),
+            len(report.databases_repaired),
         )
         return 0
 

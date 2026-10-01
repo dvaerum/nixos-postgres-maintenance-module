@@ -42,6 +42,7 @@ class LockdownManager:
         self._lockdown_path = lockdown_path
         self._locked: set[str] = set()
         self._queue: queue.Queue[_LockRequest | None] = queue.Queue()
+        self._error: Exception | None = None
         # One dedicated connection, used only by this thread -- tagged
         # the same as every other guard connection so the termination
         # sweep below can tell it apart from a connection this manager
@@ -70,28 +71,51 @@ class LockdownManager:
         self._conn.close()
 
     def _submit(self, dbname: str, action: str) -> None:
+        if self._error is not None:
+            raise self._error
         request = _LockRequest(dbname, action)
         self._queue.put(request)
         request.done.wait()
+        if self._error is not None:
+            raise self._error
 
     def _run(self) -> None:
         while True:
             request = self._queue.get()
             if request is None:
                 break
-            if request.action == "lock":
-                self._locked.add(request.dbname)
-            else:
-                self._locked.discard(request.dbname)
-            self._write_file()
-            _reload_and_confirm(self._conn)
-            if request.action == "lock":
-                self._conn.execute(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = %s AND application_name <> 'collation-guard'",
-                    (request.dbname,),
-                )
+            try:
+                if request.action == "lock":
+                    self._locked.add(request.dbname)
+                else:
+                    self._locked.discard(request.dbname)
+                self._write_file()
+                _reload_and_confirm(self._conn)
+                if request.action == "lock":
+                    self._conn.execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = %s AND application_name <> 'collation-guard'",
+                        (request.dbname,),
+                    )
+            except Exception as exc:
+                self._error = exc
+                request.done.set()
+                self._drain_with_error()
+                return
             request.done.set()
+
+    def _drain_with_error(self) -> None:
+        """Called once this thread is dead (about to `return` from
+        _run() after an unrecoverable failure) -- unblocks every other
+        caller already waiting in _submit() on a request still sitting
+        in the queue, since nothing is left to dequeue them."""
+        while True:
+            try:
+                queued = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if queued is not None:
+                queued.done.set()
 
     def _write_file(self) -> None:
         if not self._locked:
