@@ -5,10 +5,13 @@ as the real systemd ExecStart does, just without systemd itself.
 
 from __future__ import annotations
 
+import sys
+
 import psycopg
 import pytest
 
 from collation_guard import main
+from collation_guard.hooks import Hook, HooksConfig
 
 
 def _host_port(pg_dsn: str) -> tuple[str, str]:
@@ -113,3 +116,41 @@ def test_run_dry_run_lists_partition_candidates_without_repairing(
         assert f"{name}.public.events" in out
     finally:
         admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_run_prestart_hook_blocking_failure_aborts_before_any_database(pg_dsn: str) -> None:
+    host, port = _host_port(pg_dsn)
+    failing_hook = Hook(
+        path=sys.executable, args=["-c", "import sys; sys.exit(1)"], block_on_failure=True
+    )
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(pre_start=[failing_hook]),
+    )
+
+    assert not report.success
+    assert report.databases_processed == []
+
+
+def test_run_prestart_hook_non_blocking_failure_still_processes_databases(pg_dsn: str) -> None:
+    host, port = _host_port(pg_dsn)
+    failing_hook = Hook(
+        path=sys.executable, args=["-c", "import sys; sys.exit(1)"], block_on_failure=False
+    )
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(pre_start=[failing_hook]),
+    )
+
+    assert report.success
+    assert "postgres" in report.databases_processed

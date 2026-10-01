@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 import psycopg
 
 from . import collation, partitions
+from .hooks import Hook, HooksConfig, run_hook
 
 logger = logging.getLogger("collation_guard")
 
@@ -145,6 +146,35 @@ def _process_glibc_stamp(host: str, port: str, glibc_locales_path: str, report: 
             collation.set_glibc_stamp(admin_conn, glibc_locales_path)
 
 
+# Failure.database value for a failure that isn't about any specific
+# database -- a global (preStart/onSuccess/postRun) hook failing, or
+# template0.
+GLOBAL = "(global)"
+
+
+def _run_global_hooks(hooks: list[Hook], stage: str, report: RunReport) -> bool:
+    """Runs a list of global (non-per-database) hooks for one stage.
+    Returns False if a blockOnFailure=true hook failed (the caller
+    decides what that means -- abort now, for preStart; just a failure
+    entry for onSuccess/postRun), True otherwise."""
+    ok = True
+    for hook in hooks:
+        result = run_hook(hook, stage=stage)
+        if result.ok:
+            continue
+        logger.warning("%s hook %s failed: %s", stage, hook.path, result.stderr)
+        if result.block_on_failure:
+            report.failures.append(
+                Failure(
+                    database=GLOBAL,
+                    relation=stage,
+                    error=f"{stage} hook {hook.path} failed (exit {result.returncode})",
+                )
+            )
+            ok = False
+    return ok
+
+
 def run(
     host: str,
     port: str,
@@ -152,9 +182,14 @@ def run(
     glibc_locales_path: str,
     partition_repair_enabled: bool,
     max_repair_attempts: int,
+    hooks: HooksConfig | None = None,
     dry_run: bool = False,
 ) -> RunReport:
     report = RunReport()
+    hooks = hooks or HooksConfig()
+
+    if not dry_run and not _run_global_hooks(hooks.pre_start, "pre_start", report):
+        return report
 
     with _connect(host, port, "postgres") as admin_conn:
         databases = collation.connectable_databases(admin_conn)
