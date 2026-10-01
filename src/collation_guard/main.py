@@ -96,6 +96,8 @@ def _process_database(
         # databases_processed. Other databases are unaffected.
         return
 
+    failures_before = len(report.failures)
+
     with _connect(host, port, dbname) as conn:
         result = collation.process_database(conn)
         if result.reindexed:
@@ -119,6 +121,11 @@ def _process_database(
             _repair_partitions_in(conn, dbname, max_attempts, report)
 
     report.databases_processed.append(dbname)
+
+    if len(report.failures) == failures_before:
+        _run_hooks(
+            hooks.per_database.on_success, "database_success", report, database=dbname
+        )
 
 
 def _process_glibc_stamp(host: str, port: str, glibc_locales_path: str, report: RunReport) -> None:

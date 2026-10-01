@@ -276,3 +276,45 @@ def test_run_per_database_prestart_non_blocking_failure_still_processes_it(pg_ds
     assert report.success
     assert "template1" in report.databases_processed
     assert "postgres" in report.databases_processed
+
+
+def test_run_per_database_onsuccess_blocking_failure_adds_failure_despite_clean_processing(
+    pg_dsn: str,
+) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(path=sys.executable, args=["-c", _FAIL_FOR_TEMPLATE1], block_on_failure=True)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(on_success=[hook])),
+    )
+
+    # template1's own Postgres processing was perfectly clean -- it's
+    # still "processed," just not "success" overall, because its
+    # onSuccess hook itself failed.
+    assert "template1" in report.databases_processed
+    assert not report.success
+    assert any(f.database == "template1" for f in report.failures)
+
+
+def test_run_per_database_onsuccess_non_blocking_failure_leaves_database_successful(
+    pg_dsn: str,
+) -> None:
+    host, port = _host_port(pg_dsn)
+    hook = Hook(path=sys.executable, args=["-c", _FAIL_FOR_TEMPLATE1], block_on_failure=False)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(on_success=[hook])),
+    )
+
+    assert "template1" in report.databases_processed
+    assert report.success
