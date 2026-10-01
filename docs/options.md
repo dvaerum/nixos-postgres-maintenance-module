@@ -123,17 +123,21 @@ package
 
 
 
-Executables run, in order, after the guard fails (e\.g\. to alert
-on-call or trigger a restore)\. Runs even if the guard’s own
-process is killed or crashes, via the unit’s ` OnFailure= `
-dependency – not just on a clean non-zero exit\.
-` COLLATION_GUARD_CONTEXT ` carries
-` {"stage": "on_failure", "failures": [{"database": ..., "relation": ..., "error": ...}, ...]} `\.
+Run after the guard fails or crashes outright – even if the
+guard’s own process is killed, via the unit’s ` OnFailure= `
+dependency, not just a clean non-zero exit (the one guarantee
+a dead process can’t arrange for itself)\. The *trigger* stays
+systemd-native; the hooks themselves use the exact same
+mechanism as every other stage\. ` blockOnFailure = true ` + a
+non-zero exit makes the companion unit itself report failed
+status (visible to ` systemctl --failed ` and anything
+monitoring systemd unit health) – there’s nothing left to
+block booting at this point, the main run has already failed\.
 
 
 
 *Type:*
-list of package
+list of (submodule)
 
 
 
@@ -142,6 +146,134 @@ list of package
 ```nix
 [ ]
 ```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onFailure\.\*\.args
+
+
+
+Extra arguments passed to the hook executable\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onFailure\.\*\.blockOnFailure
+
+
+
+Whether a non-zero exit from this hook should be treated as a
+failure of whatever it’s attached to – aborting the whole run
+immediately for ` preStart `; skipping just that one database
+for ` perDatabase.preStart `; adding an extra failure entry
+(which can flip an otherwise-successful run’s exit code) for
+every other stage, including the ` onFailure ` companion unit’s
+own reported status\. No default – must be set explicitly, or
+evaluation throws naming the option path\. See the hook-point
+descriptions below for exactly what each stage blocks\.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onFailure\.\*\.environment
+
+
+
+Inline environment variables for this hook\. Merged with
+` environmentFile ` and the stage’s own default variables
+(` COLLATION_GUARD_STAGE `/` DATABASE `/` CONTEXT `/` ERROR `) – a key
+defined by more than one of those three sources is a hard
+error at run time (` EnvironmentCollisionError `), never a
+silent override\. See docs/decisions/0006\.
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onFailure\.\*\.environmentFile
+
+
+
+` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
+path), merged with ` environment ` and the stage’s own default
+variables under the same no-collision rule\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onFailure\.\*\.path
+
+
+
+Executable to run, e\.g\. ` lib.getExe pkgs.curl ` or an explicit
+path into a derivation’s own ` /bin ` directory\.
+
+
+
+*Type:*
+absolute path
 
 *Declared by:*
  - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
@@ -152,15 +284,15 @@ list of package
 
 
 
-Executables run, in order, after the guard completes with no
-failures (e\.g\. to notify success or prune old pre-start
-backups)\. ` COLLATION_GUARD_CONTEXT ` carries
-` {"stage": "on_success", "databases_processed": [...], "databases_repaired": [...]} `\.
+Run, in order, once – only when every database processed with
+zero failures (unlike ` postRun `, which always runs regardless
+of outcome)\. ` blockOnFailure = true ` + a non-zero exit adds a
+failure to an otherwise-clean run, flipping its exit code to 1\.
 
 
 
 *Type:*
-list of package
+list of (submodule)
 
 
 
@@ -169,6 +301,602 @@ list of package
 ```nix
 [ ]
 ```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onSuccess\.\*\.args
+
+
+
+Extra arguments passed to the hook executable\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onSuccess\.\*\.blockOnFailure
+
+
+
+Whether a non-zero exit from this hook should be treated as a
+failure of whatever it’s attached to – aborting the whole run
+immediately for ` preStart `; skipping just that one database
+for ` perDatabase.preStart `; adding an extra failure entry
+(which can flip an otherwise-successful run’s exit code) for
+every other stage, including the ` onFailure ` companion unit’s
+own reported status\. No default – must be set explicitly, or
+evaluation throws naming the option path\. See the hook-point
+descriptions below for exactly what each stage blocks\.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onSuccess\.\*\.environment
+
+
+
+Inline environment variables for this hook\. Merged with
+` environmentFile ` and the stage’s own default variables
+(` COLLATION_GUARD_STAGE `/` DATABASE `/` CONTEXT `/` ERROR `) – a key
+defined by more than one of those three sources is a hard
+error at run time (` EnvironmentCollisionError `), never a
+silent override\. See docs/decisions/0006\.
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onSuccess\.\*\.environmentFile
+
+
+
+` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
+path), merged with ` environment ` and the stage’s own default
+variables under the same no-collision rule\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.onSuccess\.\*\.path
+
+
+
+Executable to run, e\.g\. ` lib.getExe pkgs.curl ` or an explicit
+path into a derivation’s own ` /bin ` directory\.
+
+
+
+*Type:*
+absolute path
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onFailure
+
+
+
+Run after a database’s own processing fails\.
+` COLLATION_GUARD_ERROR ` carries a summary of what failed\.
+` blockOnFailure = true ` + a non-zero exit adds a second,
+distinct failure entry alongside the database’s original one
+– both visible independently\.
+
+
+
+*Type:*
+list of (submodule)
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onFailure\.\*\.args
+
+
+
+Extra arguments passed to the hook executable\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onFailure\.\*\.blockOnFailure
+
+
+
+Whether a non-zero exit from this hook should be treated as a
+failure of whatever it’s attached to – aborting the whole run
+immediately for ` preStart `; skipping just that one database
+for ` perDatabase.preStart `; adding an extra failure entry
+(which can flip an otherwise-successful run’s exit code) for
+every other stage, including the ` onFailure ` companion unit’s
+own reported status\. No default – must be set explicitly, or
+evaluation throws naming the option path\. See the hook-point
+descriptions below for exactly what each stage blocks\.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onFailure\.\*\.environment
+
+
+
+Inline environment variables for this hook\. Merged with
+` environmentFile ` and the stage’s own default variables
+(` COLLATION_GUARD_STAGE `/` DATABASE `/` CONTEXT `/` ERROR `) – a key
+defined by more than one of those three sources is a hard
+error at run time (` EnvironmentCollisionError `), never a
+silent override\. See docs/decisions/0006\.
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onFailure\.\*\.environmentFile
+
+
+
+` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
+path), merged with ` environment ` and the stage’s own default
+variables under the same no-collision rule\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onFailure\.\*\.path
+
+
+
+Executable to run, e\.g\. ` lib.getExe pkgs.curl ` or an explicit
+path into a derivation’s own ` /bin ` directory\.
+
+
+
+*Type:*
+absolute path
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onSuccess
+
+
+
+Run after a database’s own processing succeeds\.
+` blockOnFailure = true ` + a non-zero exit adds a failure for
+that database even though its actual Postgres processing was
+clean – for a notification that’s itself load-bearing\.
+
+
+
+*Type:*
+list of (submodule)
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onSuccess\.\*\.args
+
+
+
+Extra arguments passed to the hook executable\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onSuccess\.\*\.blockOnFailure
+
+
+
+Whether a non-zero exit from this hook should be treated as a
+failure of whatever it’s attached to – aborting the whole run
+immediately for ` preStart `; skipping just that one database
+for ` perDatabase.preStart `; adding an extra failure entry
+(which can flip an otherwise-successful run’s exit code) for
+every other stage, including the ` onFailure ` companion unit’s
+own reported status\. No default – must be set explicitly, or
+evaluation throws naming the option path\. See the hook-point
+descriptions below for exactly what each stage blocks\.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onSuccess\.\*\.environment
+
+
+
+Inline environment variables for this hook\. Merged with
+` environmentFile ` and the stage’s own default variables
+(` COLLATION_GUARD_STAGE `/` DATABASE `/` CONTEXT `/` ERROR `) – a key
+defined by more than one of those three sources is a hard
+error at run time (` EnvironmentCollisionError `), never a
+silent override\. See docs/decisions/0006\.
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onSuccess\.\*\.environmentFile
+
+
+
+` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
+path), merged with ` environment ` and the stage’s own default
+variables under the same no-collision rule\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.onSuccess\.\*\.path
+
+
+
+Executable to run, e\.g\. ` lib.getExe pkgs.curl ` or an explicit
+path into a derivation’s own ` /bin ` directory\.
+
+
+
+*Type:*
+absolute path
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.preStart
+
+
+
+Run, in order, before the guard examines *each* database
+(e\.g\. a per-database backup) – ` COLLATION_GUARD_DATABASE `
+names which one\. ` blockOnFailure = true ` + a non-zero exit
+skips processing of that one database entirely (no reindex,
+no partition repair, not counted as processed); every other
+database in the same run is unaffected\.
+
+
+
+*Type:*
+list of (submodule)
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.preStart\.\*\.args
+
+
+
+Extra arguments passed to the hook executable\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.preStart\.\*\.blockOnFailure
+
+
+
+Whether a non-zero exit from this hook should be treated as a
+failure of whatever it’s attached to – aborting the whole run
+immediately for ` preStart `; skipping just that one database
+for ` perDatabase.preStart `; adding an extra failure entry
+(which can flip an otherwise-successful run’s exit code) for
+every other stage, including the ` onFailure ` companion unit’s
+own reported status\. No default – must be set explicitly, or
+evaluation throws naming the option path\. See the hook-point
+descriptions below for exactly what each stage blocks\.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.preStart\.\*\.environment
+
+
+
+Inline environment variables for this hook\. Merged with
+` environmentFile ` and the stage’s own default variables
+(` COLLATION_GUARD_STAGE `/` DATABASE `/` CONTEXT `/` ERROR `) – a key
+defined by more than one of those three sources is a hard
+error at run time (` EnvironmentCollisionError `), never a
+silent override\. See docs/decisions/0006\.
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.preStart\.\*\.environmentFile
+
+
+
+` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
+path), merged with ` environment ` and the stage’s own default
+variables under the same no-collision rule\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.perDatabase\.preStart\.\*\.path
+
+
+
+Executable to run, e\.g\. ` lib.getExe pkgs.curl ` or an explicit
+path into a derivation’s own ` /bin ` directory\.
+
+
+
+*Type:*
+absolute path
 
 *Declared by:*
  - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
@@ -179,16 +907,16 @@ list of package
 
 
 
-Executables run, in order, after the guard finishes – always,
-whether it succeeded or failed (e\.g\. to emit a single
-run-completed metric/notification regardless of outcome)\.
-` COLLATION_GUARD_CONTEXT ` carries
-` {"stage": "post_run", "success": true|false} `\.
+Run, in order, after the guard finishes – always, whether it
+succeeded or failed, and after ` onSuccess ` if that also ran\.
+` blockOnFailure = true ` + a non-zero exit adds a failure even
+after every database already finished cleanly, which can flip
+an otherwise-clean run’s exit code to 1\.
 
 
 
 *Type:*
-list of package
+list of (submodule)
 
 
 
@@ -203,21 +931,16 @@ list of package
 
 
 
-## services\.postgresqlCollationGuard\.hooks\.preStart
+## services\.postgresqlCollationGuard\.hooks\.postRun\.\*\.args
 
 
 
-Executables run, in order, before the guard examines any
-database (e\.g\. to take a pre-emptive backup)\. Each must exit 0;
-a non-zero exit aborts the guard before any check or repair
-runs\. Invoked with no arguments; JSON context is passed via the
-` COLLATION_GUARD_CONTEXT ` environment variable
-(` {"stage": "pre_start"} `)\.
+Extra arguments passed to the hook executable\.
 
 
 
 *Type:*
-list of package
+list of string
 
 
 
@@ -225,6 +948,293 @@ list of package
 
 ```nix
 [ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.postRun\.\*\.blockOnFailure
+
+
+
+Whether a non-zero exit from this hook should be treated as a
+failure of whatever it’s attached to – aborting the whole run
+immediately for ` preStart `; skipping just that one database
+for ` perDatabase.preStart `; adding an extra failure entry
+(which can flip an otherwise-successful run’s exit code) for
+every other stage, including the ` onFailure ` companion unit’s
+own reported status\. No default – must be set explicitly, or
+evaluation throws naming the option path\. See the hook-point
+descriptions below for exactly what each stage blocks\.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.postRun\.\*\.environment
+
+
+
+Inline environment variables for this hook\. Merged with
+` environmentFile ` and the stage’s own default variables
+(` COLLATION_GUARD_STAGE `/` DATABASE `/` CONTEXT `/` ERROR `) – a key
+defined by more than one of those three sources is a hard
+error at run time (` EnvironmentCollisionError `), never a
+silent override\. See docs/decisions/0006\.
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.postRun\.\*\.environmentFile
+
+
+
+` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
+path), merged with ` environment ` and the stage’s own default
+variables under the same no-collision rule\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.postRun\.\*\.path
+
+
+
+Executable to run, e\.g\. ` lib.getExe pkgs.curl ` or an explicit
+path into a derivation’s own ` /bin ` directory\.
+
+
+
+*Type:*
+absolute path
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.preStart
+
+
+
+Run, in order, before the guard examines any database (e\.g\. to
+take a pre-emptive backup)\. ` blockOnFailure = true ` + a
+non-zero exit aborts the whole run immediately, before
+enumerating or connecting to any database\.
+
+
+
+*Type:*
+list of (submodule)
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.preStart\.\*\.args
+
+
+
+Extra arguments passed to the hook executable\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.preStart\.\*\.blockOnFailure
+
+
+
+Whether a non-zero exit from this hook should be treated as a
+failure of whatever it’s attached to – aborting the whole run
+immediately for ` preStart `; skipping just that one database
+for ` perDatabase.preStart `; adding an extra failure entry
+(which can flip an otherwise-successful run’s exit code) for
+every other stage, including the ` onFailure ` companion unit’s
+own reported status\. No default – must be set explicitly, or
+evaluation throws naming the option path\. See the hook-point
+descriptions below for exactly what each stage blocks\.
+
+
+
+*Type:*
+null or boolean
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.preStart\.\*\.environment
+
+
+
+Inline environment variables for this hook\. Merged with
+` environmentFile ` and the stage’s own default variables
+(` COLLATION_GUARD_STAGE `/` DATABASE `/` CONTEXT `/` ERROR `) – a key
+defined by more than one of those three sources is a hard
+error at run time (` EnvironmentCollisionError `), never a
+silent override\. See docs/decisions/0006\.
+
+
+
+*Type:*
+attribute set of string
+
+
+
+*Default:*
+
+```nix
+{ }
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.preStart\.\*\.environmentFile
+
+
+
+` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
+path), merged with ` environment ` and the stage’s own default
+variables under the same no-collision rule\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.hooks\.preStart\.\*\.path
+
+
+
+Executable to run, e\.g\. ` lib.getExe pkgs.curl ` or an explicit
+path into a derivation’s own ` /bin ` directory\.
+
+
+
+*Type:*
+absolute path
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.maxParallelDatabases
+
+
+
+How many databases to process concurrently (bounded, not
+unbounded – all databases share the same Postgres instance’s
+disk I/O, shared buffers, and WAL writer, so an unbounded
+parallelism could make things slower, not faster, on a cluster
+with many databases)\.
+
+
+
+*Type:*
+positive integer, meaning >0
+
+
+
+*Default:*
+
+```nix
+4
 ```
 
 *Declared by:*

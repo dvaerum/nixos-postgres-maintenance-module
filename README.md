@@ -31,36 +31,51 @@ see `docs/decisions/0003-store-path-not-version-string-for-the-c-utf-8-stamp.md`
 ```mermaid
 flowchart TD
     A[postgresql.service starts] --> B[postgresql-collation-guard.service]
-    B --> C{template0 stale?}
+    B --> PRE[preStart hooks]
+    PRE -->|blockOnFailure fails| X[exit 1]
+    PRE --> C{template0 stale?}
     C -- yes --> D[refresh template0's version<br/>no user objects, refresh-only]
     C -- no --> E
     D --> E{glibc stamp stale<br/>or missing?}
     E -- yes --> F[reindex every C.* database<br/>per relation, independently]
     F --> G{all reindexed cleanly?}
     G -- yes --> H[advance the stamp]
-    G -- no --> X[exit 1]
+    G -- no --> X
     H --> I
-    E -- no --> I[for each database]
-    I --> J{Postgres-tracked<br/>mismatch?}
-    J -- yes --> K[reindex every user table<br/>per relation, independently]
-    K --> L{all reindexed cleanly?}
-    L -- yes --> M[refresh database +<br/>named collation versions]
-    L -- no --> X
-    M --> N
-    J -- no --> N{partition repair<br/>enabled?}
-    N -- yes --> O[find candidate partitioned tables<br/>non-C/POSIX collated key]
-    O --> P[for each leaf: find misplaced rows<br/>pg_get_partition_constraintdef]
-    P --> Q{rows found?}
-    Q -- yes --> R[cross-partition UPDATE via root table<br/>DISABLE/ENABLE TRIGGER USER]
-    R --> S{clean, or<br/>safety cap hit?}
-    S -- clean --> I
-    S -- capped --> X
-    Q -- no --> I
-    N -- no --> I
-    I --> T[every database processed]
-    T --> U[exit 0]
-    U --> V[postgresql-setup.service]
+    E -- no --> I["for each database<br/>(parallel, bounded by maxParallelDatabases)"]
+
+    subgraph perdb["per-database worker"]
+        DPRE[perDatabase.preStart hook] -->|blockOnFailure fails| SKIP[skip this database]
+        DPRE --> J{Postgres-tracked<br/>mismatch?}
+        J -- yes --> K[reindex every user table<br/>per relation, independently]
+        K --> L{all reindexed cleanly?}
+        L -- yes --> M[refresh database +<br/>named collation versions]
+        L -- no --> DFAIL
+        M --> N
+        J -- no --> N{partition repair<br/>enabled?}
+        N -- yes --> O[find candidate partitioned tables<br/>non-C/POSIX collated key]
+        O --> P[for each leaf: find misplaced rows<br/>pg_get_partition_constraintdef]
+        P --> Q{rows found?}
+        Q -- yes --> R[cross-partition UPDATE via root table<br/>DISABLE/ENABLE TRIGGER USER]
+        R --> SCAP{clean, or<br/>safety cap hit?}
+        SCAP -- clean --> DOK[perDatabase.onSuccess hook]
+        SCAP -- capped --> DFAIL[perDatabase.onFailure hook]
+        Q -- no --> DOK
+        N -- no --> DOK
+    end
+
+    I --> perdb
+    perdb --> T[merge results, sorted]
+    T --> SUCC{run succeeded?}
+    SUCC -- yes --> ONSUCC[onSuccess hooks]
+    ONSUCC --> POST
+    SUCC -- no --> POST[postRun hooks, always]
+    POST --> U{exit 0 or 1}
+    U -- 0 --> V[postgresql-setup.service]
     V --> W[postgresql.target]
+    U -- 1 --> X
+    X -.OnFailure=.-> OF["collation-guard --on-failure<br/>(separate process, runs even on crash)"]
+    OF --> ONFAIL[onFailure hooks]
     X -.blocks.-> V
 ```
 
@@ -73,6 +88,13 @@ blocks `postgresql-setup.service` and `postgresql.target`. That's
 deliberate: a reindex or repair failure is almost always a real
 constraint violation that needs a human decision, not something safe to
 silently skip past.
+
+Databases are processed concurrently, bounded by
+`services.postgresqlCollationGuard.maxParallelDatabases` (default 4) —
+the work is I/O-bound (waiting on Postgres over a socket), so this cuts
+boot time on a multi-database cluster without needing to raise it
+further; see `docs/decisions/0006-hooks-and-parallel-per-database-processing.md`
+for why it's bounded rather than unbounded.
 
 ## Usage
 
@@ -91,13 +113,40 @@ option reference, or `nixosModule/options.nix` directly.
 
 ### Hooks
 
-`services.postgresqlCollationGuard.hooks.{preStart,onSuccess,onFailure,postRun}`
-each take a list of packages run at the corresponding stage (e.g. to
-take a pre-run backup, alert on-call on failure, or emit a metric
-regardless of outcome). Each hook is invoked as `<exe> <stage>`; JSON
-run context is passed via the `COLLATION_GUARD_CONTEXT_FILE` path set
-in the hook's environment. See `nixosModule/options.nix` for the exact
-JSON shape per stage.
+Seven hook points, all sharing the same shape -- the original four,
+whole-run hooks (`preStart`, `onSuccess`, `onFailure`, `postRun`), plus
+a `perDatabase.{preStart,onSuccess,onFailure}` tier that knows which
+database it's about:
+
+```nix
+services.postgresqlCollationGuard.hooks.perDatabase.onFailure = [
+  {
+    path = lib.getExe pkgs.curl;
+    args = [ "-X" "POST" "https://hooks.example.com/notify" "-d" "@-" ];
+    environmentFile = config.sops.secrets."notify-webhook-token".path;
+    blockOnFailure = false; # must be set explicitly -- no default
+  }
+];
+```
+
+Every hook gets `COLLATION_GUARD_STAGE` and, where relevant,
+`COLLATION_GUARD_DATABASE`/`COLLATION_GUARD_CONTEXT` (JSON)/
+`COLLATION_GUARD_ERROR` (a plain one-line summary, no JSON parsing
+needed, on failure-shaped stages). `environmentFile` and inline
+`environment` merge with those -- any variable name defined by more
+than one source is a hard error (`EnvironmentCollisionError`) before
+the hook ever runs, never a silent override.
+
+`blockOnFailure` always does something real and specific to that hook
+point (abort the run, skip one database, add a failure that can flip
+an otherwise-clean exit code, or -- for `onFailure` -- make the
+companion systemd unit itself report failed status) -- see
+`docs/decisions/0006-hooks-and-parallel-per-database-processing.md`
+for the full table. `onFailure` is triggered by systemd's `OnFailure=`
+(the one guarantee that survives the guard process being killed or
+crashing outright), but the hooks themselves run through the exact
+same mechanism as every other stage, from a second `collation-guard
+--on-failure` entry point into the same binary.
 
 ### CLI
 
