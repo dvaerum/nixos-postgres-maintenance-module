@@ -814,6 +814,31 @@ def test_run_locks_and_unlocks_a_database_that_needs_a_fix(
         admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
 
+def test_run_glibc_stamp_phase_locks_postgres_itself_without_self_harm(
+    c_utf8_pg_dsn: str, c_utf8_lockdown_conf_path
+) -> None:
+    """The direct regression test for the bug this plan's design review
+    caught: `postgres` itself is C.UTF-8 on this cluster, so the
+    glibc-stamp phase locks it -- a naive pid <> pg_backend_pid()
+    exclusion would have killed either admin_conn (held open for the
+    whole phase) or the per-database conn opened for "postgres"
+    specifically, both alive at once. The run must still complete
+    successfully."""
+    host, port = _host_port(c_utf8_pg_dsn)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        lockdown_path=str(c_utf8_lockdown_conf_path),
+    )
+
+    assert report.success
+    assert "postgres" in report.databases_processed
+
+
 def test_run_on_failure_cleans_up_an_active_lockdown_file(
     pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path, tmp_path
 ) -> None:

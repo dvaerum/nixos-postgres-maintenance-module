@@ -135,6 +135,27 @@ def c_locale_pg_dsn(
     )
 
 
+@pytest.fixture(scope="session")
+def c_utf8_lockdown_conf_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("lockdown-cutf8") / "lockdown.conf"
+
+
+@pytest.fixture(scope="session")
+def c_utf8_pg_dsn(
+    tmp_path_factory: pytest.TempPathFactory, c_utf8_lockdown_conf_path: Path
+) -> Iterator[str]:
+    """A third, separate cluster whose default locale is C.UTF-8 from
+    initdb -- needed only to reproduce the glibc-stamp phase's
+    self-inflicted-harm regression: `postgres` (the database) is itself
+    C.UTF-8 here, so it's a real member of c_utf8_databases(), letting
+    a test prove the lock/unlock wiring there doesn't kill the admin
+    connection held throughout the phase, or the per-database
+    connection opened for `postgres` specifically."""
+    yield from _start_cluster(
+        tmp_path_factory, "c-utf8", "C.UTF-8", _PORT + 2, c_utf8_lockdown_conf_path
+    )
+
+
 @pytest.fixture
 def admin_conn(pg_dsn: str) -> Iterator[psycopg.Connection]:
     """Autocommit connection to the cluster's default `postgres` database --

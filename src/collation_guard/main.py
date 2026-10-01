@@ -193,7 +193,13 @@ def _process_database(
     return report
 
 
-def _process_glibc_stamp(host: str, port: str, glibc_locales_path: str, report: RunReport) -> None:
+def _process_glibc_stamp(
+    host: str,
+    port: str,
+    glibc_locales_path: str,
+    report: RunReport,
+    manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
+) -> None:
     with _connect(host, port, "postgres") as admin_conn:
         stamp = collation.glibc_stamp(admin_conn)
         if stamp == glibc_locales_path:
@@ -207,19 +213,41 @@ def _process_glibc_stamp(host: str, port: str, glibc_locales_path: str, report: 
         c_utf8_dbs = collation.c_utf8_databases(admin_conn)
         all_ok = True
         for dbname in c_utf8_dbs:
+            # Connect BEFORE locking, same pattern as _process_database
+            # -- a new connection attempt made AFTER dbname is already
+            # locked would itself be rejected by pg_hba.conf, since a
+            # `reject` rule matches on database/user/address only;
+            # application_name isn't known until after authentication,
+            # so it can't exempt a brand-new connection the way it
+            # exempts an existing session from the termination sweep.
+            # This matters specifically when dbname == "postgres" (if
+            # it happens to be C.UTF-8): admin_conn and this conn are
+            # then two separate, already-open, application_name-tagged
+            # connections to the same database being locked -- both
+            # survive the termination sweep, but only because neither
+            # had to be (re)established while the lock was active.
+            #
+            # There's no per-database staleness to check here either
+            # (Postgres never versions C/C.*/POSIX at all) -- once the
+            # stamp itself is stale, every member of c_utf8_dbs
+            # genuinely gets reindexed.
             with _connect(host, port, dbname) as conn:
-                result = collation.reindex_all_user_tables(conn)
-                if result.reindexed:
-                    report.databases_repaired.append(dbname)
-                for table in result.failed:
-                    all_ok = False
-                    report.failures.append(
-                        Failure(
-                            database=dbname,
-                            relation=table,
-                            error="REINDEX failed (C.UTF-8 stamp check)",
+                manager.lock(dbname)
+                try:
+                    result = collation.reindex_all_user_tables(conn)
+                    if result.reindexed:
+                        report.databases_repaired.append(dbname)
+                    for table in result.failed:
+                        all_ok = False
+                        report.failures.append(
+                            Failure(
+                                database=dbname,
+                                relation=table,
+                                error="REINDEX failed (C.UTF-8 stamp check)",
+                            )
                         )
-                    )
+                finally:
+                    manager.unlock(dbname)
 
         # Only advance the stamp once every C.UTF-8 database reindexed
         # cleanly -- otherwise the next run must retry, not silently skip.
@@ -312,7 +340,7 @@ def run(
                     Failure(database="template0", relation="template0", error=template0_error)
                 )
 
-        _process_glibc_stamp(host, port, glibc_locales_path, report)
+        _process_glibc_stamp(host, port, glibc_locales_path, report, manager)
 
         # Each worker gets its own psycopg.Connection and its own
         # RunReport (see _process_database's docstring) -- no shared
