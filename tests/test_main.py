@@ -62,6 +62,17 @@ def failing_database(admin_conn: psycopg.Connection, pg_dsn: str) -> Iterator[st
         admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
 
+def test_connect_tags_the_connection_with_application_name(pg_dsn: str) -> None:
+    """Every connection the guard opens is tagged -- this is what lets
+    the lockdown termination sweep tell "another guard connection to
+    the same database" apart from "someone else's connection," instead
+    of relying on a single PID (see docs/decisions/0007)."""
+    host, port = _host_port(pg_dsn)
+    with main._connect(host, port, "postgres") as conn:
+        row = conn.execute("SELECT current_setting('application_name')").fetchone()
+    assert row == ("collation-guard",)
+
+
 def test_run_is_a_clean_success_on_an_unremarkable_cluster(pg_dsn: str) -> None:
     host, port = _host_port(pg_dsn)
 

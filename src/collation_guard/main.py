@@ -61,7 +61,10 @@ def _report_context(report: RunReport) -> dict[str, object]:
 
 
 def _connect(host: str, port: str, dbname: str) -> psycopg.Connection:
-    return psycopg.connect(f"host={host} port={port} dbname={dbname}", prepare_threshold=None)
+    return psycopg.connect(
+        f"host={host} port={port} dbname={dbname} application_name=collation-guard",
+        prepare_threshold=None,
+    )
 
 
 def _repair_partitions_in(
