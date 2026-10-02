@@ -82,6 +82,26 @@ def partition_leaves(conn: psycopg.Connection, schema: str, table: str) -> list[
     return leaves
 
 
+def _repair_one_pass(
+    conn: psycopg.Connection,
+    schema: str,
+    table: str,
+    leaves: list[str],
+    key_columns: list[str],
+) -> int:
+    """One scan-and-repair pass across every given (already
+    rule-filtered) leaf. Returns rows repaired this pass -- 0 means
+    nothing left to fix, the signal repair_partition_table's retry-cap
+    loop stops on."""
+    repaired = 0
+    for leaf in leaves:
+        for ctid in misplaced_rows(conn, schema, leaf):
+            repair_row(conn, schema, table, leaf, key_columns, ctid)
+            conn.commit()
+            repaired += 1
+    return repaired
+
+
 def repair_partition_table(
     conn: psycopg.Connection,
     schema: str,
@@ -110,14 +130,9 @@ def repair_partition_table(
     repaired = 0
 
     for _attempt in range(max_attempts):
-        found_any = False
-        for leaf in leaves:
-            for ctid in misplaced_rows(conn, schema, leaf):
-                found_any = True
-                repair_row(conn, schema, table, leaf, key_columns, ctid)
-                conn.commit()
-                repaired += 1
-        if not found_any:
+        found = _repair_one_pass(conn, schema, table, leaves, key_columns)
+        repaired += found
+        if found == 0:
             return PartitionRepairResult(repaired=repaired, skipped_ruled_children=skipped)
 
     return PartitionRepairResult(repaired=repaired, skipped_ruled_children=skipped, exhausted=True)

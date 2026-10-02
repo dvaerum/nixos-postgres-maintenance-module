@@ -268,18 +268,31 @@ def test_repair_partition_table_gives_up_after_max_attempts(
 ) -> None:
     """A pathological case where every pass keeps finding something to
     fix (can't be constructed with real data -- see the NOTE above --
-    so this proves the loop itself terminates and reports exhaustion,
-    via a stub that always reports one fake misplaced row)."""
-    monkeypatch.setattr(partitions, "misplaced_rows", lambda conn, schema, child: ["(0,1)"])
+    so this proves the retry-cap loop itself terminates and reports
+    exhaustion), via a stub for the per-pass mechanism -- not the two
+    lower-level primitives (misplaced_rows/repair_row) it's built
+    from, which this loop no longer needs to know about directly."""
     monkeypatch.setattr(
-        partitions, "repair_row", lambda conn, schema, table, child, key_columns, ctid: None
+        partitions, "_repair_one_pass", lambda conn, schema, table, leaves, key_columns: 2
     )
 
     result = repair_partition_table(partitioned_db, "public", "parent", ["k"], max_attempts=5)
 
     assert result.exhausted is True
     assert not result.ok
-    assert result.repaired == 5 * 2  # 2 non-ruled children, 1 fake row each, every attempt
+    assert result.repaired == 5 * 2  # the stub reports 2 repaired every pass, capped at 5
+
+
+def test_repair_one_pass_returns_zero_against_a_clean_partition(
+    partitioned_db: psycopg.Connection,
+) -> None:
+    """The per-pass mechanism itself, proven directly against real
+    data -- the retry-cap loop around it is proven separately above
+    with a stub, since a genuinely-exhausting case can't be
+    constructed with real data (see the NOTE above)."""
+    leaves = partitions.partition_leaves(partitioned_db, "public", "parent")
+    repaired = partitions._repair_one_pass(partitioned_db, "public", "parent", leaves, ["k"])
+    assert repaired == 0
 
 
 @pytest.fixture

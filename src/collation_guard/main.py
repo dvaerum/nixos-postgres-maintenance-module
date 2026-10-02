@@ -97,8 +97,18 @@ def _locked_connection(
 
 
 def _apply_collation_result(
-    result: collation.DatabaseResult, dbname: str, report: RunReport
+    result: collation.DatabaseResult,
+    dbname: str,
+    report: RunReport,
+    *,
+    error_suffix: str = "",
 ) -> bool:
+    """Turns a collation.DatabaseResult into RunReport entries -- the
+    one place this happens, shared by the per-database path and
+    _process_glibc_stamp's own reindex call (error_suffix distinguishes
+    the two in failure messages; refresh_error is always None from the
+    glibc-stamp path, since reindex_all_user_tables never sets it --
+    only process_database does)."""
     if result.reindexed:
         logger.info(
             "%s: reindexed %d table(s) for a Postgres-tracked collation mismatch: %s",
@@ -108,7 +118,9 @@ def _apply_collation_result(
         )
         _mark_repaired(report, dbname)
     for table in result.failed:
-        report.failures.append(Failure(database=dbname, relation=table, error="REINDEX failed"))
+        report.failures.append(
+            Failure(database=dbname, relation=table, error=f"REINDEX failed{error_suffix}")
+        )
     if result.refresh_error is not None:
         report.failures.append(
             Failure(database=dbname, relation=dbname, error=result.refresh_error)
@@ -261,17 +273,10 @@ def _process_glibc_stamp(
             # genuinely gets reindexed.
             with _locked_connection(host, port, dbname, manager, lambda _conn: True) as conn:
                 result = collation.reindex_all_user_tables(conn)
-                if result.reindexed:
-                    _mark_repaired(report, dbname)
-                for table in result.failed:
+                if not _apply_collation_result(
+                    result, dbname, report, error_suffix=" (C.UTF-8 stamp check)"
+                ):
                     all_ok = False
-                    report.failures.append(
-                        Failure(
-                            database=dbname,
-                            relation=table,
-                            error="REINDEX failed (C.UTF-8 stamp check)",
-                        )
-                    )
 
         # Only advance the stamp once every C.UTF-8 database reindexed
         # cleanly -- otherwise the next run must retry, not silently skip.
