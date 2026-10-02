@@ -28,6 +28,14 @@ see `docs/decisions/0003-store-path-not-version-string-for-the-c-utf-8-stamp.md`
 
 ## How it works
 
+Two diagrams, one flow: the first is the top-level run, start to exit —
+the glibc/`C.*` phase, then fanning out into one worker per database. The
+"per-database worker" box in the middle of it is where that fan-out
+happens; the second diagram is what each of those workers actually does,
+expanded out separately so it fits on screen.
+
+### Top-level orchestration
+
 ```mermaid
 flowchart TD
     A[postgresql.service starts] --> B[postgresql-collation-guard.service]
@@ -58,8 +66,11 @@ flowchart TD
     X -.blocks.-> V
 ```
 
-Each per-database worker above runs the following independently
-(parallel, bounded by `maxParallelDatabases`):
+### Per-database worker
+
+This expands the "per-database worker" box from the diagram above. One
+instance of this flow runs per database, independently and concurrently,
+bounded by `maxParallelDatabases`:
 
 ```mermaid
 flowchart TD
