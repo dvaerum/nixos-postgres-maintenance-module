@@ -43,35 +43,8 @@ flowchart TD
     G -- no --> I
     H --> I
     E -- no --> I["for each database<br/>(parallel, bounded by maxParallelDatabases)"]
-
-    subgraph perdb["per-database worker"]
-        DPRE[perDatabase.preStart hook] -->|blockOnFailure fails| SKIP[skip this database]
-        DPRE --> NEEDLOCK{needs a fix?}
-        NEEDLOCK -- yes --> LOCK[lock this database]
-        LOCK --> J
-        NEEDLOCK -- no --> J{Postgres-tracked<br/>mismatch?}
-        J -- yes --> K[reindex every user table<br/>per relation, independently]
-        K --> L{all reindexed cleanly?}
-        L -- yes --> M[refresh database +<br/>named collation versions]
-        L -- no --> N
-        M --> N
-        J -- no --> N{partition repair<br/>enabled?}
-        N -- yes --> O[find candidate partitioned tables<br/>non-C/POSIX collated key]
-        O --> P[for each leaf: find misplaced rows<br/>pg_get_partition_constraintdef]
-        P --> Q{rows found?}
-        Q -- yes --> R[cross-partition UPDATE via root table<br/>DISABLE/ENABLE TRIGGER USER]
-        R --> SCAP{clean, or<br/>safety cap hit?}
-        SCAP -- clean --> UNLOCK[unlock<br/>only if a lock was taken above]
-        SCAP -- capped --> UNLOCK
-        Q -- no --> UNLOCK
-        N -- no --> UNLOCK
-        UNLOCK --> OK{collation AND partition<br/>repair both clean?}
-        OK -- yes --> DOK[perDatabase.onSuccess hook]
-        OK -- no --> DFAIL[perDatabase.onFailure hook]
-    end
-
-    I --> perdb
-    perdb --> T[merge results, sorted]
+    I --> PERDB[per-database worker<br/>see diagram below]
+    PERDB --> T[merge results, sorted]
     T --> SUCC{run succeeded?}
     SUCC -- yes --> ONSUCC[onSuccess hooks]
     ONSUCC --> POST
@@ -83,6 +56,36 @@ flowchart TD
     X -.OnFailure=.-> OF["collation-guard --on-failure<br/>(separate process, runs even on crash)<br/>also cleans up a lockdown file left<br/>behind by a crash mid-lock"]
     OF --> ONFAIL[onFailure hooks]
     X -.blocks.-> V
+```
+
+Each per-database worker above runs the following independently
+(parallel, bounded by `maxParallelDatabases`):
+
+```mermaid
+flowchart TD
+    DPRE[perDatabase.preStart hook] -->|blockOnFailure fails| SKIP[skip this database]
+    DPRE --> NEEDLOCK{needs a fix?}
+    NEEDLOCK -- yes --> LOCK[lock this database]
+    LOCK --> J
+    NEEDLOCK -- no --> J{Postgres-tracked<br/>mismatch?}
+    J -- yes --> K[reindex every user table<br/>per relation, independently]
+    K --> L{all reindexed cleanly?}
+    L -- yes --> M[refresh database +<br/>named collation versions]
+    L -- no --> N
+    M --> N
+    J -- no --> N{partition repair<br/>enabled?}
+    N -- yes --> O[find candidate partitioned tables<br/>non-C/POSIX collated key]
+    O --> P[for each leaf: find misplaced rows<br/>pg_get_partition_constraintdef]
+    P --> Q{rows found?}
+    Q -- yes --> R[cross-partition UPDATE via root table<br/>DISABLE/ENABLE TRIGGER USER]
+    R --> SCAP{clean, or<br/>safety cap hit?}
+    SCAP -- clean --> UNLOCK[unlock<br/>only if a lock was taken above]
+    SCAP -- capped --> UNLOCK
+    Q -- no --> UNLOCK
+    N -- no --> UNLOCK
+    UNLOCK --> OK{collation AND partition<br/>repair both clean?}
+    OK -- yes --> DOK[perDatabase.onSuccess hook]
+    OK -- no --> DFAIL[perDatabase.onFailure hook]
 ```
 
 A single relation/row failure never blocks the rest: every reindex and
