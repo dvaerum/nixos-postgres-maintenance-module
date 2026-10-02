@@ -1107,3 +1107,65 @@ def test_main_passes_max_parallel_databases_env_var_to_run(
 
     assert main.main() == 0
     assert captured["max_parallel_databases"] == 7
+
+
+def test_run_dedupes_databases_repaired_across_glibc_stamp_and_worker_paths(
+    c_utf8_pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A C.UTF-8 database can be marked repaired on two DIFFERENT
+    RunReport instances in the same run: once on the top-level report
+    from _process_glibc_stamp() (which mutates it directly), once on
+    its own per-worker report from _process_database() (merged into
+    the top-level report only afterward, via plain list concatenation
+    in run()). _mark_repaired()'s dedup only sees duplicates within a
+    single report instance -- it can't see across that merge boundary.
+    The final report.databases_repaired must still have exactly one
+    entry for such a database, not two."""
+    host, port = _host_port(c_utf8_pg_dsn)
+    name = "cg_main_test_glibc_and_partition_dup"
+    with psycopg.connect(
+        f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
+    ) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin.execute(f'CREATE DATABASE "{name}"')  # inherits the cluster's C.UTF-8 default
+
+    with psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None) as conn:
+        conn.execute("CREATE TABLE parent (id serial, k text) PARTITION BY RANGE (k)")
+        conn.execute(
+            "CREATE TABLE child_a PARTITION OF parent FOR VALUES FROM (MINVALUE) TO ('m')"
+        )
+        conn.execute("CREATE TABLE child_b PARTITION OF parent FOR VALUES FROM ('m') TO (MAXVALUE)")
+        conn.execute("INSERT INTO parent (k) VALUES ('apple')")
+        conn.commit()
+
+    # Simulate one misplaced row being found and repaired -- see the
+    # same-named test above for why a *genuinely* misplaced row can't
+    # be constructed in this single-locale fast tier.
+    call_state = {"done": False}
+    real_misplaced_rows = partitions.misplaced_rows
+
+    def fake_misplaced_rows(conn: psycopg.Connection, schema: str, child: str) -> list[object]:
+        if not call_state["done"] and child == "child_a":
+            call_state["done"] = True
+            (ctid,) = conn.execute("SELECT ctid FROM child_a WHERE k = 'apple'").fetchone()
+            return [ctid]
+        return real_misplaced_rows(conn, schema, child)
+
+    monkeypatch.setattr(partitions, "misplaced_rows", fake_misplaced_rows)
+
+    try:
+        report = main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-and-partition-dup",
+            partition_repair_enabled=True,
+            max_repair_attempts=10,
+        )
+
+        assert report.success
+        assert report.databases_repaired.count(name) == 1
+    finally:
+        with psycopg.connect(
+            f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
+        ) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{name}"')

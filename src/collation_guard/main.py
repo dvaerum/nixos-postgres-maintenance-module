@@ -392,7 +392,8 @@ def run(
             for future in futures:
                 sub_report = future.result()
                 report.databases_processed.extend(sub_report.databases_processed)
-                report.databases_repaired.extend(sub_report.databases_repaired)
+                for dbname in sub_report.databases_repaired:
+                    _mark_repaired(report, dbname)
                 report.failures.extend(sub_report.failures)
 
         report.databases_processed.sort()
