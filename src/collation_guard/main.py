@@ -198,10 +198,12 @@ def _process_database(
 
     def needs_lock(conn: psycopg.Connection) -> bool:
         # Cheap, read-only checks decide whether this database needs
-        # locking at all -- a database with nothing to fix is never
-        # locked (no lock()/unlock() call, no entry in the lockdown
-        # file), matching this project's own existing detection logic
-        # rather than inventing a new one.
+        # locking at all, reusing this project's own existing detection
+        # logic rather than inventing a new one. A stale collation
+        # stamp is real detected drift, but partition_repair_candidates()
+        # is only an applicability filter -- an eligible table, not a
+        # confirmed misplaced row (see its own docstring) -- so a
+        # database can still be locked here and found clean.
         locked = collation.is_database_stale(conn)
         if partition_repair_enabled:
             locked = locked or bool(partitions.partition_repair_candidates(conn))

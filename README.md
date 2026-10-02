@@ -211,16 +211,11 @@ collation-guard --dry-run # list partition-repair candidates across the cluster,
   session on a database before work on it begins; see
   `docs/decisions/0007-connection-lockdown-during-repair.md`.
 - **No real-drift test coverage for row-level partition repair under
-  glibc.** Closed for ICU: `tests/nixos/icu-drift.nix` builds two
-  Postgres binaries against two different ICU releases and swaps them
-  against the same on-disk `$PGDATA`, proving a row that's genuinely
-  misplaced by a real collation-comparison change (not just a
-  `collversion` bump) is correctly detected and repaired end-to-end —
-  see `docs/decisions/0008-icu-drift-test.md`. Still open for glibc: it's
-  the C library the entire nixpkgs closure links against, not a single
-  swappable override the way Postgres's `icu` dependency is; see 0008's
-  "Why ICU, not glibc" and `docs/learnings/partition-repair-testing.md`
-  for the full reasoning.
+  glibc.** Closed for ICU by `tests/nixos/icu-drift.nix`
+  (`docs/decisions/0008-icu-drift-test.md`); still open for glibc. See
+  0008's "Why ICU, not glibc" and
+  `docs/learnings/partition-repair-testing.md` for the full mechanism
+  and reasoning.
 
 See `docs/decisions/` for the full reasoning behind each piece, and
 `docs/learnings/` for other non-obvious findings from building this.

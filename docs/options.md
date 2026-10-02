@@ -130,12 +130,16 @@ moment – closing the gap where a client not itself ordered
 after ` postgresql-setup.service `/` postgresql.target ` (local
 or remote, since ` postgresql.service ` is already accepting
 connections by the time this guard runs) could otherwise
-connect against inconsistent state\. A database with nothing
-to fix is never locked\. Default ` true ` since this closes a
-real correctness gap, but every existing deployment gets this
-behavior on the next upgrade with no config change – turn it
-off here if there’s a specific reason to allow concurrent
-connections during the guard’s run\. See
+connect against inconsistent state\. A database with no stale
+collation and no partition-repair-eligible table is never
+locked – eligibility is a structural applicability check,
+not proof a row is actually misplaced, so an eligible
+database can still be locked and found clean\. Default ` true `
+since this closes a real correctness gap, but every existing
+deployment gets this behavior on the next upgrade with no
+config change – turn it off here if there’s a specific
+reason to allow concurrent connections during the guard’s
+run\. See
 docs/decisions/0007-connection-lockdown-during-repair\.md\.
 
 

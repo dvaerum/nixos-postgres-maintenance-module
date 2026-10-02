@@ -154,15 +154,18 @@ connection), work, unlock. Reproduced directly via a third ephemeral
 test cluster whose default locale is `C.UTF-8` from `initdb`, so
 `postgres` is a genuine member of `c_utf8_databases()`.
 
-## Lock only what actually needs it
+## Lock only what the existing detection already flags
 
 Per-database locking (`_process_database`) is driven by the same cheap,
 already-existing detection functions
 (`database_collation_is_stale`/`stale_named_collations`/
 `partition_repair_candidates`) used to decide whether a reindex/repair
-is needed at all -- a database with nothing to fix never calls
+might be needed -- a database flagged by neither one never calls
 `lock()`, proven via a real, pre-existing connection surviving
-untouched throughout the run. The glibc-stamp phase has no equivalent
+untouched throughout the run. `partition_repair_candidates()` is an
+applicability filter, not a confirmed misplaced row (see its own
+docstring), so a database can still be locked here and found clean on
+a given run. The glibc-stamp phase has no equivalent
 per-database filter to apply: Postgres never versions `C`/`C.*`/`POSIX`
 at all, so once the cluster-wide stamp itself is stale, every member of
 `c_utf8_databases()` genuinely gets reindexed and is locked for its own
