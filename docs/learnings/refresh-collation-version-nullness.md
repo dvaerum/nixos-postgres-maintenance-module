@@ -48,9 +48,12 @@ from it** -- `CREATE DATABASE ... TEMPLATE template0` itself checks
 `template0`'s own recorded-vs-actual NULL-ness consistency before
 copying it, and errors with `template database "template0" has a
 collation version, but no actual collation version could be determined`
-if it's inconsistent. This is why `tests/conftest.py` maintains **two
-separate** ephemeral clusters (`pg_dsn`, initialized with a real libc
-locale, and `c_locale_pg_dsn`, initialized with `C`) rather than one:
-a single cluster can't exercise both a genuine libc-locale refresh
-*and* a from-scratch `C.UTF-8` database creation once its `template0`
-has been touched.
+if it's inconsistent. This is why `tests/conftest.py` dedicates **two
+separate** clusters to this specific reproduction (`pg_dsn`,
+initialized with a real libc locale, and `c_locale_pg_dsn`, initialized
+with `C`): a single cluster can't exercise both a genuine libc-locale
+refresh *and* a from-scratch `C.UTF-8` database creation once its
+`template0` has been touched. (A third, separately-purposed cluster,
+`c_utf8_pg_dsn`, also exists in the same file -- for an unrelated
+connection-lockdown regression, see
+`docs/decisions/0007-connection-lockdown-during-repair.md`.)

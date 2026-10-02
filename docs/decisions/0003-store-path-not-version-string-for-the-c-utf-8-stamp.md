@@ -56,6 +56,6 @@ release, without bumping `collversion` at all -- ICU's own bug tracker
 (ICU-22544) calls this "the first time in ten years" that happened.
 Unlike the `C.UTF-8` case, there is no equivalent stamp this project
 can compare for ICU, because ICU's version string *did not change*
-when the behavior did. See `docs/learnings/` for this documented as an
-accepted gap, not attempted here (this fleet's own databases don't use
-the `icu` provider).
+when the behavior did. See README's "Known limitations" section for
+this documented as an accepted gap, not attempted here (this fleet's
+own databases don't use the `icu` provider).
