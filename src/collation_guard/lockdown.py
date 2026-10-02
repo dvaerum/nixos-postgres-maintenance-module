@@ -92,6 +92,10 @@ class LockdownManager:
                 self._write_file()
                 _reload_and_confirm(self._conn)
                 if request.action == "lock":
+                    # pg_terminate_backend:
+                    # https://www.postgresql.org/docs/17/functions-admin.html
+                    # pg_stat_activity columns:
+                    # https://www.postgresql.org/docs/17/monitoring-stats.html
                     self._conn.execute(
                         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                         "WHERE datname = %s AND application_name <> 'collation-guard'",
@@ -139,7 +143,11 @@ def _reload_and_confirm(conn: psycopg.Connection) -> None:
     succeed/fail against the stale rules for a short window
     afterward). pg_conf_load_time() is the authoritative signal
     Postgres itself updates once a reload has genuinely completed --
-    poll until it changes before returning."""
+    poll until it changes before returning.
+    https://www.postgresql.org/docs/17/functions-admin.html (Server
+    Signaling Functions, pg_reload_conf) and
+    https://www.postgresql.org/docs/17/functions-info.html
+    (pg_conf_load_time)."""
     before = conn.execute("SELECT pg_conf_load_time()").fetchone()
     conn.execute("SELECT pg_reload_conf()")
     deadline = time.monotonic() + _RELOAD_CONFIRM_TIMEOUT

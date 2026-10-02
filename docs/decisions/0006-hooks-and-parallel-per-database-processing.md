@@ -124,7 +124,13 @@ the full text. If anything else (a DBA note, another tool, or -- as
 confirmed live in this project's own container tests -- NixOS's own
 `services.postgresql` module, which sets a default comment on this
 exact database) ever put a comment there, this guard would have
-silently destroyed it with no trace.
+silently destroyed it with no trace. Both the full-replace-only
+semantics of `COMMENT ON`
+(https://www.postgresql.org/docs/17/sql-comment.html -- "Issuing a new
+COMMENT command for the same object replaces the existing comment")
+and `pg_shdescription` being shared cluster-wide, not per-database
+(https://www.postgresql.org/docs/17/catalog-pg-shdescription.html)
+are documented, not just empirically confirmed.
 
 Fixed to treat the stamp as one line *within* the comment,
 found/replaced by pattern rather than assumed to own the whole string.

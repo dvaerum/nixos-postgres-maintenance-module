@@ -11,9 +11,13 @@ string like `"2.42"`.
 
 Postgres never records a version for `C`/`C.*`/`POSIX` locales at all
 (`get_collation_actual_version()` returns `NULL` for them regardless of
-library version -- confirmed against PG16 source). A database using
-`C.UTF-8` can drift with zero signal from Postgres's own catalogs, so
-this project has to track the underlying glibc build itself.
+library version -- confirmed against PG16 source, not stated in the
+official docs for `datcollversion`/`collversion`:
+https://www.postgresql.org/docs/17/catalog-pg-database.html,
+https://www.postgresql.org/docs/17/catalog-pg-collation.html). A
+database using `C.UTF-8` can drift with zero signal from Postgres's
+own catalogs, so this project has to track the underlying glibc build
+itself.
 
 A bare version number is not a safe comparison key for that purpose:
 nixpkgs#245360 (fixed in commit `43da9e8ff`, "glibcLocales: disable

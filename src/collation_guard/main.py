@@ -280,8 +280,10 @@ def _process_glibc_stamp(
 
 
 # Failure.database value for a failure that isn't about any specific
-# database -- a global (preStart/onSuccess/postRun) hook failing, or
-# template0.
+# database -- a global (preStart/onSuccess/postRun) hook failing.
+# template0 failures use its own literal name instead (see run()) since
+# it isn't a lockable/connectable database either, but is still a
+# specific, nameable thing.
 GLOBAL = "(global)"
 
 

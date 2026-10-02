@@ -171,12 +171,10 @@ same mechanism as every other stage, from a second `collation-guard
 services.postgresqlCollationGuard.connectionLockdown.enable = false; # default true
 ```
 
-Default `true`: closes the gap above by rejecting new connections to a
-database (and terminating any already-open session) for exactly the
-duration it's actively being reindexed/repaired, and only if it
-actually needs a fix — a database with nothing to fix is never locked.
-Turn it off only if there's a specific reason to allow concurrent
-connections during the guard's run.
+Default `true` -- see the explanation above and
+`docs/decisions/0007-connection-lockdown-during-repair.md`. Turn it off
+only if there's a specific reason to allow concurrent connections
+during the guard's run.
 
 ### CLI
 
@@ -196,12 +194,15 @@ collation-guard --dry-run # list partition-repair candidates across the cluster,
   re-verification regardless of version match (a much bigger, different
   feature); documented as an accepted gap. Only relevant if a consumer
   uses the `icu` provider.
-- **Partition repair assumes exclusive access to the cluster.** It runs
-  in the pre-boot window before `postgresql-setup`/`postgresql.target`
-  activate, so no application ever has a connection open yet in the
-  normal case — but a documented, still-open PG deadlock pattern exists
-  if this module is ever invoked against an already-live cluster with
-  concurrent writers.
+- **Partition repair assumed exclusive access to the cluster; closed by
+  connection lockdown.** It runs in the pre-boot window before
+  `postgresql-setup`/`postgresql.target` activate, so no application
+  ever has a connection open yet in the normal case — and for anything
+  that doesn't follow that ordering (a cron job, a manually-run `psql`,
+  a service only `Wants=`-ing Postgres), `connectionLockdown` (default
+  `true`) now rejects new connections and terminates any already-open
+  session on a database before work on it begins; see
+  `docs/decisions/0007-connection-lockdown-during-repair.md`.
 - **No real-drift test coverage for row-level partition repair under
   glibc.** Closed for ICU: `tests/nixos/icu-drift.nix` builds two
   Postgres binaries against two different ICU releases and swaps them

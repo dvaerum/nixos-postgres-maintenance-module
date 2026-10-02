@@ -38,7 +38,8 @@ class PartitionRepairResult:
 def partition_children(conn: psycopg.Connection, schema: str, table: str) -> list[str]:
     """Direct partition children of `table`, via pg_inherits -- not
     recursive (a sub-partitioned child is itself a partitioned table
-    with its own children, handled separately; see cycle 11)."""
+    with its own children, handled separately by partition_leaves()
+    below). https://www.postgresql.org/docs/17/catalog-pg-inherits.html"""
     rows = conn.execute(
         """
         SELECT c.relname
@@ -54,6 +55,7 @@ def partition_children(conn: psycopg.Connection, schema: str, table: str) -> lis
 
 
 def is_partitioned(conn: psycopg.Connection, schema: str, table: str) -> bool:
+    """https://www.postgresql.org/docs/17/catalog-pg-partitioned-table.html"""
     row = conn.execute(
         "SELECT EXISTS (SELECT 1 FROM pg_partitioned_table WHERE partrelid = %s::regclass)",
         (f"{schema}.{table}",),
@@ -144,11 +146,13 @@ def has_rule(conn: psycopg.Connection, schema: str, table: str) -> bool:
 def misplaced_rows(conn: psycopg.Connection, schema: str, child: str) -> list[object]:
     """ctid of every row in `child` that no longer satisfies its own
     partition bound constraint, checked directly against
-    `pg_get_partition_constraintdef()` -- not by provoking Postgres's
-    own ATTACH-validation error and parsing it. Confirmed against
-    PG16's tablecmds.c: that error ("partition constraint of relation
-    ... is violated by some row") names only the table, never the row
-    -- there is no DETAIL with row values to key a fix off of.
+    `pg_get_partition_constraintdef()`
+    (https://www.postgresql.org/docs/17/functions-info.html) -- not by
+    provoking Postgres's own ATTACH-validation error and parsing it.
+    Confirmed against PG16's tablecmds.c: that error ("partition
+    constraint of relation ... is violated by some row") names only
+    the table, never the row -- there is no DETAIL with row values to
+    key a fix off of.
     """
     row = conn.execute(
         "SELECT pg_get_partition_constraintdef(%s::regclass)",
@@ -173,12 +177,13 @@ def repair_row(
     key_columns: list[str],
     ctid: object,
 ) -> None:
-    """Force Postgres's own cross-partition UPDATE row movement (PG11+)
-    to relocate one misplaced row to wherever it actually belongs under
-    the current collation: an UPDATE of a partition key column to its
-    own unchanged value still re-evaluates the row against every
-    sibling partition's bounds, and moves it (DELETE + INSERT under the
-    hood) if its current partition no longer matches.
+    """Force Postgres's own cross-partition UPDATE row movement (PG11+,
+    https://www.postgresql.org/docs/17/sql-update.html) to relocate one
+    misplaced row to wherever it actually belongs under the current
+    collation: an UPDATE of a partition key column to its own unchanged
+    value still re-evaluates the row against every sibling partition's
+    bounds, and moves it (DELETE + INSERT under the hood) if its
+    current partition no longer matches.
 
     Must be issued against `root_table` (the top-level partitioned
     table), identifying the physical row via `tableoid` + `ctid` --
@@ -188,13 +193,15 @@ def repair_row(
     fails, never considering siblings (see
     docs/learnings/partition-repair-testing.md).
 
-    DISABLE/ENABLE TRIGGER USER brackets this so that internal
-    DELETE+INSERT doesn't fire user-defined triggers as a side effect
-    of what is, from the application's point of view, a no-op write --
-    USER (not ALL) deliberately leaves FK/constraint-enforcement
-    triggers active throughout (see docs/decisions/0004, and the real
-    bug this distinction avoids: BUG #18516, where DISABLE TRIGGER ALL
-    silently dropped FK enforcement with no re-validation on re-enable).
+    DISABLE/ENABLE TRIGGER USER
+    (https://www.postgresql.org/docs/17/sql-altertable.html) brackets
+    this so that internal DELETE+INSERT doesn't fire user-defined
+    triggers as a side effect of what is, from the application's point
+    of view, a no-op write -- USER (not ALL) deliberately leaves
+    FK/constraint-enforcement triggers active throughout (see
+    docs/decisions/0004, and the real bug this distinction avoids: BUG
+    #18516, where DISABLE TRIGGER ALL silently dropped FK enforcement
+    with no re-validation on re-enable).
     """
     child_table = sql.Identifier(schema, child)
     set_clause = sql.SQL(", ").join(

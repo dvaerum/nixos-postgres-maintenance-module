@@ -16,9 +16,12 @@ touching either directly. Default `true`
 
 README's own "Future work" section flagged a real, unsolved gap, but
 with the wrong scope: "a client on another host." Confirmed directly
-against nixpkgs's `services.postgresql` module: it's `Type=notify`, and
-the real `postgres` binary sends `READY=1` only once it's already
-accepting client connections. `postgresql-collation-guard.service` only
+against nixpkgs's `services.postgresql` module: it's `Type=notify`
+(Postgres's own docs confirm `Type=notify` support --
+https://www.postgresql.org/docs/17/server-start.html -- but not this
+specific `READY=1`-ordering guarantee, which is a `postmaster.c`
+source-level fact outside their scope), and the real `postgres` binary
+sends `READY=1` only once it's already accepting client connections. `postgresql-collation-guard.service` only
 has `After=postgresql.service`, so by the time it starts, Postgres is
 already listening. The actual gap is **anything not itself ordered
 `After=postgresql-setup.service`/`postgresql.target`** -- a cron job, a
@@ -36,12 +39,16 @@ rejected:
 - It *can* be set from a connection already inside the target database
   (verified: `ALTER DATABASE lockme CONNECTION LIMIT 0` run from a
   session connected to `lockme` succeeds and doesn't kill that same
-  session), and a non-superuser connection attempt is correctly
-  rejected afterward with no reload needed.
+  session -- this specific self-connection behavior isn't documented,
+  only empirically confirmed), and a non-superuser connection attempt
+  is correctly rejected afterward with no reload needed.
 - But **superuser connections are entirely exempt from `CONNECTION
-  LIMIT`** (verified empirically, matches documented Postgres
-  behavior) -- a real gap relative to `pg_hba.conf`'s `reject` method,
-  which rejects anyone, superuser or not.
+  LIMIT`** -- documented:
+  https://www.postgresql.org/docs/17/sql-createdatabase.html, CONNECTION
+  LIMIT notes ("the limit is not enforced against superusers or
+  background worker processes") -- a real gap relative to
+  `pg_hba.conf`'s `reject` method, which rejects anyone, superuser or
+  not.
 - More importantly: achieving true per-database lock *duration* (a
   database unlocks the instant its own work finishes, not when the
   whole batch finishes) means each worker thread would mutate its own
@@ -58,7 +65,10 @@ property regardless of how many databases are locked at any moment.
 read-only Nix store path (verified directly against
 `nixos/modules/services/databases/postgresql.nix`) -- but
 `include_if_exists <path>` directives are re-resolved on every reload,
-not just at startup, and `services.postgresql.authentication` is
+not just at startup (https://www.postgresql.org/docs/17/auth-pg-hba-conf.html:
+"The pg_hba.conf file is read on start-up and when the main server
+process receives a SIGHUP signal", which re-reads the whole file
+including its includes), and `services.postgresql.authentication` is
 additive (`types.lines`, merged via `lib.mkBefore`), so this project's
 own module adds one `include_if_exists` line, ahead of every other
 rule, with zero required config from the consumer. The file doesn't
@@ -79,20 +89,25 @@ locked.
 
 ## `pg_conf_load_time()`, not `pg_hba_file_rules`, confirms a reload completed
 
-`pg_reload_conf()` only *requests* a reload (sends SIGHUP) -- it's
-asynchronous, with no built-in way to synchronously confirm the
-postmaster has actually finished re-reading `pg_hba.conf`. A first
-attempt polled `pg_hba_file_rules` after reload, on the theory that it
-reflects the live, loaded ruleset. That was a dead end: the view
-reflects a fresh parse of the file **on disk**, not the postmaster's
-active ruleset, so it resolved instantly regardless of whether a
-reload had actually happened -- confirmed by reproducing the exact
-race it was meant to close (8 threads, rapid lock/unlock cycles; a
-brand-new connection occasionally still succeeded against stale rules
-for a short window after `lock()`/`unlock()` returned).
+`pg_reload_conf()` (https://www.postgresql.org/docs/17/functions-admin.html)
+only *requests* a reload (sends SIGHUP) -- it's asynchronous, with no
+built-in way to synchronously confirm the postmaster has actually
+finished re-reading `pg_hba.conf`. A first attempt polled
+`pg_hba_file_rules` after reload, on the theory that it reflects the
+live, loaded ruleset. That was a dead end, and is in fact documented:
+https://www.postgresql.org/docs/17/view-pg-hba-file-rules.html --
+"this view reports on the current contents of the file, not on what
+was last loaded by the server" -- the view reflects a fresh parse of
+the file **on disk**, not the postmaster's active ruleset, so it
+resolved instantly regardless of whether a reload had actually
+happened -- confirmed by reproducing the exact race it was meant to
+close (8 threads, rapid lock/unlock cycles; a brand-new connection
+occasionally still succeeded against stale rules for a short window
+after `lock()`/`unlock()` returned).
 
-`pg_conf_load_time()` is the authoritative signal: Postgres updates it
-only once a reload has genuinely completed. `LockdownManager` captures
+`pg_conf_load_time()` (https://www.postgresql.org/docs/17/functions-info.html)
+is the authoritative signal: Postgres updates it only once a reload
+has genuinely completed. `LockdownManager` captures
 it before calling `pg_reload_conf()`, then polls (short interval, 2s
 timeout) until it changes, before treating the request as applied. The
 single-writer-thread design means there's never a second reload in
@@ -105,7 +120,9 @@ before it.
 
 Every connection the guard opens is tagged
 `application_name=collation-guard`. The termination sweep excludes by
-this tag, not by a single PID:
+this tag, not by a single PID (`pg_terminate_backend`/`pg_stat_activity`
+documented at https://www.postgresql.org/docs/17/functions-admin.html
+and https://www.postgresql.org/docs/17/monitoring-stats.html):
 
 ```sql
 SELECT pg_terminate_backend(pid) FROM pg_stat_activity
@@ -121,11 +138,13 @@ connection issuing the terminate query, not any *other* guard
 connection to the same database -- it would have killed `admin_conn`.
 
 `application_name` only helps for sessions that are **already open**
-when `lock()` runs, though -- `pg_hba.conf` evaluates `database`/`user`/
-`address` at authentication time, before `application_name` is even
-known to the server, so it can't exempt a **brand-new** connection
-attempt the way it exempts an existing session from the termination
-sweep. This surfaced as a real, caught bug: the glibc-stamp phase's
+when `lock()` runs, though -- a `pg_hba.conf` record only matches on
+connection type, database, user, and address/auth-method
+(https://www.postgresql.org/docs/17/auth-pg-hba-conf.html --
+`application_name` is not a matchable field at all), evaluated at
+authentication time, before `application_name` is even known to the
+server, so it can't exempt a **brand-new** connection attempt the way
+it exempts an existing session from the termination sweep. This surfaced as a real, caught bug: the glibc-stamp phase's
 first implementation called `manager.lock(dbname)` *before* opening the
 per-database connection for that loop iteration -- when `dbname ==
 "postgres"`, that new connection attempt hit its own just-written

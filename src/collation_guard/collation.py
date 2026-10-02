@@ -40,7 +40,9 @@ class DatabaseResult:
 
 def database_collation_is_stale(conn: psycopg.Connection) -> bool:
     """True if the connection's current database's own default collation
-    no longer matches what's actually loaded."""
+    no longer matches what's actually loaded.
+    https://www.postgresql.org/docs/17/functions-admin.html -- Table 9.102,
+    pg_database_collation_actual_version()."""
     row = conn.execute(
         """
         SELECT datcollversion IS NOT NULL
@@ -54,7 +56,9 @@ def database_collation_is_stale(conn: psycopg.Connection) -> bool:
 
 def stale_named_collations(conn: psycopg.Connection) -> list[str]:
     """Names of named (non-default) collation objects in the current
-    database whose recorded version no longer matches what's loaded."""
+    database whose recorded version no longer matches what's loaded.
+    https://www.postgresql.org/docs/17/functions-admin.html -- Table 9.102,
+    pg_collation_actual_version()."""
     rows = conn.execute(
         """
         SELECT collname
@@ -107,18 +111,21 @@ def user_tables(conn: psycopg.Connection) -> list[tuple[str, str]]:
 
 
 def reindex_table(conn: psycopg.Connection, schema: str, table: str) -> None:
+    """https://www.postgresql.org/docs/17/sql-reindex.html"""
     conn.execute(
         sql.SQL("REINDEX TABLE {}.{}").format(sql.Identifier(schema), sql.Identifier(table))
     )
 
 
 def refresh_database_collation_version(conn: psycopg.Connection, database: str) -> None:
+    """https://www.postgresql.org/docs/17/sql-alterdatabase.html"""
     conn.execute(
         sql.SQL("ALTER DATABASE {} REFRESH COLLATION VERSION").format(sql.Identifier(database))
     )
 
 
 def refresh_named_collation_version(conn: psycopg.Connection, collation: str) -> None:
+    """https://www.postgresql.org/docs/17/sql-altercollation.html"""
     conn.execute(sql.SQL("ALTER COLLATION {} REFRESH VERSION").format(sql.Identifier(collation)))
 
 
@@ -266,15 +273,10 @@ def glibc_stamp(conn: psycopg.Connection) -> str | None:
     """The glibcLocales store path recorded the last time the C.UTF-8
     stamp was successfully advanced, or None if never recorded (a
     brand-new cluster, or one that predates this guard). Stored as one
-    line within a COMMENT ON the `postgres` database -- a shared
-    pg_shdescription catalog entry, cluster-wide, survives
-    pg_dumpall/pg_upgrade -- not a $PGDATA file, which is one accidental
-    `rm` or one backup that forgot to include it away from losing the
-    only evidence a reindex is still owed. The *store path*, not a bare
-    glibc version string, is the comparison key: nixpkgs#245360 (fixed
-    in commit 43da9e8ff) showed the same glibc version producing a
-    different, non-deterministically-built locale archive for ~6 weeks
-    in 2023, so a version number alone isn't a safe comparison key.
+    line within a COMMENT ON the `postgres` database; the store path,
+    not a bare version string, is the comparison key -- see
+    docs/decisions/0003 for why (storage choice, and the nixpkgs#245360
+    incident that ruled out a version string).
 
     Found by pattern within the comment, not by assuming the comment is
     entirely ours -- see set_glibc_stamp()."""

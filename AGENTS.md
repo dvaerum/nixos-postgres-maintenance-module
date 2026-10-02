@@ -17,7 +17,8 @@ don't re-derive decisions already recorded there.
 ```
 flake.nix          nixosModules.default, packages.default, devShells.default, checks
 pyproject.toml     single source of truth for the Python package (see "Versioning" below)
-src/collation_guard/   the package: main.py (entry point), collation.py, partitions.py
+src/collation_guard/   the package: main.py (entry point), collation.py, partitions.py,
+                    hooks.py, lockdown.py
 tests/              fast tier: pytest + ephemeral initdb/pg_ctl cluster (no systemd)
 tests/nixos/        slow tier: systemd-nspawn nixosTest containers (wiring/ordering,
                     plus icu-drift.nix -- a real multi-Postgres-build drift test,

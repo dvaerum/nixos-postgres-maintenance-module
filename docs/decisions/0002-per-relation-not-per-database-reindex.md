@@ -20,7 +20,10 @@ documented it in their own incident-response runbook
 (`gitlab-org/gitlab#370622`, `gitlab-org/gitlab#505982`). Their
 recovery procedure is a manual table-by-table loop for exactly this
 reason -- there is no flag or mode of `REINDEX DATABASE` that changes
-this behavior.
+this behavior. The official reference
+(https://www.postgresql.org/docs/17/sql-reindex.html) documents what
+`REINDEX DATABASE` does, not this all-or-nothing failure behavior --
+the GitLab incident above is the evidence for that part, not the docs.
 
 ## Consequence: a partial failure must not refresh anything
 

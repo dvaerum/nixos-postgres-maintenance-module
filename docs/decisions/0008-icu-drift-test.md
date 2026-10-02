@@ -82,8 +82,10 @@ real Postgres builds) before being encoded permanently:
    never the stored version number -- so this test proves the
    strongest, not weakest, form of the claim.
 4. The partition bound and inserted value use Postgres's own `U&'...'`
-   Unicode string-escape syntax (`U&'A\2018B'`, `U&'A\201A2'`) so the
-   test file itself stays plain ASCII, with no exotic Unicode
+   Unicode string-escape syntax
+   (https://www.postgresql.org/docs/17/sql-syntax-lexical.html, "String
+   Constants with Unicode Escapes") (`U&'A\2018B'`, `U&'A\201A2'`) so
+   the test file itself stays plain ASCII, with no exotic Unicode
    punctuation embedded in Nix/shell-quoted strings.
 
 ## Why not wired into CI

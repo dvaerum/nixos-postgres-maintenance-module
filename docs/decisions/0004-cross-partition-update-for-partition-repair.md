@@ -32,7 +32,11 @@ docs) showed it doesn't work as a *repair* mechanism at all:
   first, and *that* step scans and would reject a genuinely bad row
   just as directly. There is no bypass, by design -- see
   `docs/learnings/partition-repair-testing.md` for the full
-  reproduction.
+  reproduction. ATTACH PARTITION and its validation-skip precondition
+  (a `CHECK` constraint already validated, not `NOT VALID`) are
+  documented at https://www.postgresql.org/docs/17/sql-altertable.html;
+  the specific interaction with a `NOT VALID` constraint is this
+  project's own empirical finding, not spelled out there verbatim.
 
 In short: Postgres's own partition-bound enforcement is airtight
 against this approach. A misplaced row can only be moved by something
@@ -41,22 +45,24 @@ detach/re-attach trick.
 
 ## What replaced it: Postgres's own cross-partition `UPDATE` routing
 
-Since PG11, Postgres automatically relocates a row (`DELETE` + `INSERT`
-under the hood) when an `UPDATE` to a partition key column causes it to
-no longer satisfy its current partition's bound -- this is the
-mechanism a normal application `UPDATE` relies on every day. Using it
-here needed one more empirical correction: an `UPDATE` issued **directly
-against the child relation** does not trigger this routing at all -- it
-only re-checks that child's own bound and rejects the row outright.
-Routing only happens when the `UPDATE` is issued through the
-**top-level (root) partitioned table**, identifying the physical row
-via `tableoid` + `ctid` (confirmed by direct reproduction; see
-`docs/learnings/partition-repair-testing.md`). `repair_row()` therefore
+Since PG11 (per the PG11 release notes), Postgres automatically
+relocates a row (`DELETE` + `INSERT` under the hood) when an `UPDATE`
+to a partition key column causes it to no longer satisfy its current
+partition's bound -- this is the mechanism a normal application
+`UPDATE` relies on every day, documented at
+https://www.postgresql.org/docs/17/sql-update.html. Using it here
+needed one more empirical correction, not covered by that page: an
+`UPDATE` issued **directly against the child relation** does not
+trigger this routing at all -- it only re-checks that child's own
+bound and rejects the row outright. Routing only happens when the
+`UPDATE` is issued through the **top-level (root) partitioned table**,
+identifying the physical row via `tableoid` + `ctid` (confirmed by
+direct reproduction; see `docs/learnings/partition-repair-testing.md`). `repair_row()` therefore
 always takes the root table as an explicit argument, separate from the
 specific child/leaf being repaired (this also makes multi-level
-sub-partitioning -- cycle 11 -- work without any special-casing:
-routing from the absolute root descends through the whole tree
-regardless of depth).
+sub-partitioning work without any special-casing, since routing from
+the absolute root descends through the whole tree regardless of depth
+-- see `tests/test_partitions.py`'s sub-partitioning tests).
 
 ## `DISABLE`/`ENABLE TRIGGER USER`, not `ALL`
 
@@ -64,10 +70,11 @@ The self-assignment `UPDATE` still performs a real `DELETE` + `INSERT`
 when a row moves, which would normally fire any user-defined trigger on
 the source and destination partitions as a side effect of what is, from
 the application's point of view, a no-op maintenance write.
-`DISABLE`/`ENABLE TRIGGER USER` suppresses exactly those -- and
-deliberately not `ALL`: `ALL` would also disable Postgres's own
-internally-generated constraint triggers (foreign-key enforcement in
-particular), which must stay active throughout. `BUG #18516` is the
+`DISABLE`/`ENABLE TRIGGER USER`
+(https://www.postgresql.org/docs/17/sql-altertable.html) suppresses
+exactly those -- and deliberately not `ALL`: `ALL` would also disable
+Postgres's own internally-generated constraint triggers (foreign-key
+enforcement in particular), which must stay active throughout. `BUG #18516` is the
 real-world cautionary case: someone "optimized" a similar maintenance
 operation to `DISABLE TRIGGER ALL`, silently lost FK enforcement for
 the duration, and it was never auto-revalidated on re-enable. Cycle 8's
@@ -83,7 +90,8 @@ parse which row it names. Confirmed against PG16 source
 (`tablecmds.c`) that this error ("partition constraint of relation ...
 is violated by some row") never names the offending row -- only the
 table. `partitions.misplaced_rows()` instead queries
-`pg_get_partition_constraintdef()` directly against each leaf and finds
-every row that currently fails it (`WHERE NOT (<constraint>)`) -- a
-direct, row-level answer that doesn't depend on provoking and parsing
-an error at all.
+`pg_get_partition_constraintdef()`
+(https://www.postgresql.org/docs/17/functions-info.html) directly
+against each leaf and finds every row that currently fails it (`WHERE
+NOT (<constraint>)`) -- a direct, row-level answer that doesn't depend
+on provoking and parsing an error at all.

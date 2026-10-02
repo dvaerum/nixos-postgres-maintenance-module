@@ -24,9 +24,10 @@ partition repair was even added:
   from "REINDEX failed because of something else entirely" means
   grepping stderr for a substring, not catching a typed exception.
   Partition repair needs exactly this kind of discrimination
-  (`psycopg.errors.CheckViolation` for an ATTACH-bounds violation vs.
-  anything else), which bash has no real mechanism for beyond more
-  string matching.
+  (`psycopg.errors.CheckViolation` -- SQLSTATE `23514`,
+  https://www.postgresql.org/docs/17/errcodes-appendix.html -- for an
+  ATTACH-bounds violation vs. anything else), which bash has no real
+  mechanism for beyond more string matching.
 - **No structured control flow for retry/backoff loops.** Cycle 10's
   safety-capped repair loop, and cycle 7's per-row retry, are both
   naturally expressed as Python control flow with typed return values
