@@ -227,7 +227,7 @@ def _process_database(
         report.databases_processed.append(dbname)
         ok = collation_ok and partition_ok
     except Exception as exc:
-        logger.warning("%s: processing raised: %s", dbname, exc)
+        logger.warning("%s: processing raised: %s", dbname, exc, exc_info=True)
         report.failures.append(
             Failure(database=dbname, relation=dbname, error=f"processing raised: {exc}")
         )
@@ -365,7 +365,12 @@ def _run_hooks(
             result = run_hook(hook, stage=stage, database=database, context=context, error=error)
         except Exception as exc:
             logger.warning(
-                "%s hook %s raised for %s: %s", stage, hook.path, database or GLOBAL, exc
+                "%s hook %s raised for %s: %s",
+                stage,
+                hook.path,
+                database or GLOBAL,
+                exc,
+                exc_info=True,
             )
             if hook.block_on_failure:
                 report.failures.append(
@@ -548,12 +553,16 @@ def run_on_failure(
         try:
             lockdown.cleanup_lockdown_file(host, port, lockdown_path)
         except Exception as exc:
-            logger.warning("lockdown cleanup during --on-failure raised: %s", exc)
+            logger.warning(
+                "lockdown cleanup during --on-failure raised: %s", exc, exc_info=True
+            )
 
     try:
         hooks = load_hooks(hooks_file)
     except Exception as exc:
-        logger.warning("failed to load hooks file during --on-failure: %s", exc)
+        logger.warning(
+            "failed to load hooks file during --on-failure: %s", exc, exc_info=True
+        )
         return 1
 
     context, error = _recover_last_context(context_file)
