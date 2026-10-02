@@ -142,9 +142,10 @@ actively being worked on, and only if it actually needs a fix; see
 See `docs/options.md` (generated via `generate-doc.nix`) for the full
 option reference, or `nixosModule/options.nix` directly. See
 `examples/` for a working, tested set of scenarios (tuning,
-`connectionLockdown` opt-out, a `perDatabase.onFailure` hook) -- each
-one is exercised by `tests/nixos/examples.nix`, so a renamed/removed
-option breaks CI, not just the docs.
+`connectionLockdown`/`partitionRepair` opt-out, a `preStart` hook that
+aborts the run, a `perDatabase.onFailure` hook, and the whole-run
+`onFailure` hook) -- each one is exercised by a `tests/nixos/*.nix`
+check, so a renamed/removed option breaks CI, not just the docs.
 
 ### Hooks
 

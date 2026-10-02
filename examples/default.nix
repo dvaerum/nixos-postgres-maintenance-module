@@ -7,5 +7,8 @@
   minimal = ./minimal.nix;
   tuning = ./tuning.nix;
   connectionLockdownDisabled = ./connection-lockdown-disabled.nix;
+  partitionRepairDisabled = ./partition-repair-disabled.nix;
   perDatabaseOnFailureHook = ./per-database-onfailure-hook.nix;
+  preStartHook = ./pre-start-hook.nix;
+  onFailureHook = ./on-failure-hook.nix;
 }
