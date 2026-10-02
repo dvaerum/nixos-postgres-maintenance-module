@@ -40,20 +40,20 @@ flowchart TD
     E -- yes --> F["for each C.* database:<br/>lock -> reindex (per relation) -> unlock"]
     F --> G{all reindexed cleanly?}
     G -- yes --> H[advance the stamp]
-    G -- no --> X
+    G -- no --> I
     H --> I
     E -- no --> I["for each database<br/>(parallel, bounded by maxParallelDatabases)"]
 
     subgraph perdb["per-database worker"]
         DPRE[perDatabase.preStart hook] -->|blockOnFailure fails| SKIP[skip this database]
         DPRE --> NEEDLOCK{needs a fix?}
-        NEEDLOCK -- no --> DOK
         NEEDLOCK -- yes --> LOCK[lock this database]
-        LOCK --> J{Postgres-tracked<br/>mismatch?}
+        LOCK --> J
+        NEEDLOCK -- no --> J{Postgres-tracked<br/>mismatch?}
         J -- yes --> K[reindex every user table<br/>per relation, independently]
         K --> L{all reindexed cleanly?}
         L -- yes --> M[refresh database +<br/>named collation versions]
-        L -- no --> UNLOCK2[unlock] --> DFAIL
+        L -- no --> N
         M --> N
         J -- no --> N{partition repair<br/>enabled?}
         N -- yes --> O[find candidate partitioned tables<br/>non-C/POSIX collated key]
@@ -61,10 +61,13 @@ flowchart TD
         P --> Q{rows found?}
         Q -- yes --> R[cross-partition UPDATE via root table<br/>DISABLE/ENABLE TRIGGER USER]
         R --> SCAP{clean, or<br/>safety cap hit?}
-        SCAP -- clean --> UNLOCK1[unlock] --> DOK[perDatabase.onSuccess hook]
-        SCAP -- capped --> UNLOCK3[unlock] --> DFAIL[perDatabase.onFailure hook]
-        Q -- no --> UNLOCK1
-        N -- no --> UNLOCK1
+        SCAP -- clean --> UNLOCK[unlock<br/>only if a lock was taken above]
+        SCAP -- capped --> UNLOCK
+        Q -- no --> UNLOCK
+        N -- no --> UNLOCK
+        UNLOCK --> OK{collation AND partition<br/>repair both clean?}
+        OK -- yes --> DOK[perDatabase.onSuccess hook]
+        OK -- no --> DFAIL[perDatabase.onFailure hook]
     end
 
     I --> perdb
@@ -152,11 +155,11 @@ Every hook gets `COLLATION_GUARD_STAGE` (always), `COLLATION_GUARD_DATABASE`
 one-line summary, no JSON parsing needed, on failure-shaped stages),
 and `COLLATION_GUARD_CONTEXT` — always present, always valid JSON, on
 every single stage (an empty `{}` where there's nothing yet to report,
-e.g. `preStart`) — no need to check whether it exists before parsing
-it. `environmentFile` and inline `environment` merge with those -- any
-variable name defined by more than one source is a hard error
-(`EnvironmentCollisionError`) before the hook ever runs, never a silent
-override.
+e.g. `perDatabase.preStart`) — no need to check whether it exists
+before parsing it. `environmentFile` and inline `environment` merge
+with those -- any variable name defined by more than one source is a
+hard error (`EnvironmentCollisionError`) before the hook ever runs,
+never a silent override.
 
 `blockOnFailure` always does something real and specific to that hook
 point (abort the run, skip one database, add a failure that can flip
