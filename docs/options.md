@@ -1331,9 +1331,14 @@ true
 
 
 
-Safety cap on the per-row repair retry loop per partitioned
-table, so a pathological number of misplaced rows fails loudly
-instead of spinning forever\.
+Safety cap on the repair loop for one partitioned table, where
+each attempt is a full pass over every leaf partition, repeated
+until a pass moves nothing\. Capped rather than single-pass
+because moving a misplaced row into a different partition can
+require that partition’s own next pass to re-check it, and
+there’s no proof this always converges in one sweep (see
+docs/learnings/partition-repair-testing\.md)\. Hitting the cap
+fails loudly instead of spinning forever\.
 
 
 
