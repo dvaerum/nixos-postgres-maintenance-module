@@ -403,6 +403,33 @@ def test_run_per_database_onsuccess_non_blocking_failure_leaves_database_success
     assert report.success
 
 
+def test_run_per_database_onsuccess_hook_crash_does_not_lose_the_already_completed_work(
+    pg_dsn: str,
+) -> None:
+    """A hook that RAISES (not just exits non-zero) -- here, a bad
+    path raising FileNotFoundError from subprocess.run -- in the
+    on_success stage, after this database's real collation/partition
+    processing already completed, must not crash the whole run and
+    must not lose that already-completed database from
+    databases_processed. Regression test: _run_hooks previously let
+    any exception from run_hook() propagate all the way out of
+    run()."""
+    host, port = _host_port(pg_dsn)
+    crashing_hook = Hook(path="/nonexistent/collation-guard-test-hook", block_on_failure=True)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        hooks=HooksConfig(per_database=PerDatabaseHooks(on_success=[crashing_hook])),
+    )
+
+    assert not report.success
+    assert "postgres" in report.databases_processed
+
+
 def test_run_per_database_onfailure_blocking_failure_adds_a_second_distinct_failure(
     pg_dsn: str, failing_database: str
 ) -> None:

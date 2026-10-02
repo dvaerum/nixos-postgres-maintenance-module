@@ -303,10 +303,33 @@ def _run_hooks(
     perDatabase.preStart, just an extra failure entry for the rest),
     True otherwise. Every failing hook is recorded, not just the first
     one, and every configured hook still runs regardless of an earlier
-    one's outcome."""
+    one's outcome.
+
+    A hook that RAISES (EnvironmentCollisionError, a bad path) is
+    treated the same as a non-zero exit, not left to propagate -- for
+    a perDatabase.* hook this runs inside a ThreadPoolExecutor worker,
+    and an uncaught exception there crashes the entire run via
+    future.result(), silently dropping every other database's
+    already-completed work (see docs/decisions/0006's per-database
+    isolation guarantee)."""
     ok = True
     for hook in hooks:
-        result = run_hook(hook, stage=stage, database=database, context=context, error=error)
+        try:
+            result = run_hook(hook, stage=stage, database=database, context=context, error=error)
+        except Exception as exc:
+            logger.warning(
+                "%s hook %s raised for %s: %s", stage, hook.path, database or GLOBAL, exc
+            )
+            if hook.block_on_failure:
+                report.failures.append(
+                    Failure(
+                        database=database or GLOBAL,
+                        relation=stage,
+                        error=f"{stage} hook {hook.path} raised: {exc}",
+                    )
+                )
+                ok = False
+            continue
         if result.ok:
             continue
         logger.warning(

@@ -20,7 +20,7 @@ let
 
   # Extracted to its own file (nixosModule/validate-hook.nix) so it's
   # testable in isolation -- see tests/validate-hook.nix.
-  validateHook = import ./validate-hook.nix;
+  validateHook = import ./validate-hook.nix { inherit lib; };
 
   hookToJSON = hook: {
     inherit (hook)
