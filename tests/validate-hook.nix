@@ -59,8 +59,9 @@ let
 
   # The reserved vars run_hook() (src/collation_guard/hooks.py)
   # injects for each stage -- STAGE is universal, DATABASE only for
-  # perDatabase.*, ERROR only for the two failure-reporting stages.
-  # Kept as an explicit, independent table here (not reused from
+  # perDatabase.*, ERROR only for the three failure-reporting stages
+  # (onFailure, postRun, perDatabase.onFailure). Kept as an explicit,
+  # independent table here (not reused from
   # validate-hook.nix's own implementation) so a bug in that
   # function's own mapping can't also hide from this test.
   allReservedVars = [
