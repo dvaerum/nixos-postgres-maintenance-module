@@ -549,11 +549,15 @@ def run_on_failure(
     hits this branch.
 
     Both this cleanup step and loading the hooks file are wrapped
-    defensively: this entry point's whole purpose is "run the
-    configured onFailure hooks no matter what," so a failure in its
-    own best-effort setup (Postgres itself unreachable -- exactly the
-    scenario that triggers this unit when postgresql.service fails to
-    start -- or a corrupt hooks file) must not prevent that."""
+    defensively: a failure in either (Postgres itself unreachable --
+    exactly the scenario that triggers this unit when
+    postgresql.service fails to start -- or a corrupt hooks file)
+    must never crash this entry point itself (see docs/decisions/0006).
+    That guarantee is asymmetric, though: a lockdown-cleanup failure is
+    logged and the configured onFailure hooks still run afterward, but
+    a hooks-file load failure is fatal to the hook run itself -- there's
+    nothing left to execute -- so this returns 1 immediately with zero
+    onFailure hooks run in that case."""
     if lockdown_path is not None:
         assert host is not None and port is not None
         try:
