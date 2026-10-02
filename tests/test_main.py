@@ -12,7 +12,7 @@ from collections.abc import Iterator
 import psycopg
 import pytest
 
-from collation_guard import main, partitions
+from collation_guard import collation, main, partitions
 from collation_guard.hooks import Hook, HooksConfig, PerDatabaseHooks
 
 
@@ -1043,6 +1043,46 @@ def test_run_on_failure_lockdown_cleanup_is_a_no_op_when_no_file_exists(
     assert exit_code == 0
 
 
+def test_run_on_failure_lockdown_cleanup_crash_does_not_block_the_hooks(tmp_path) -> None:
+    """Regression test: cleanup_lockdown_file can raise (Postgres
+    itself unreachable -- exactly the scenario that triggers this
+    companion unit via OnFailure= when postgresql.service itself fails
+    to start, per nixosModule/config.nix's `requires =
+    ["postgresql.service"]`). run_on_failure must still run the
+    configured onFailure hooks instead of crashing before it ever
+    reaches them."""
+    lockdown_path = tmp_path / "lockdown.conf"
+    lockdown_path.write_text("some stale rule\n")  # exists -> cleanup doesn't short-circuit
+
+    marker = tmp_path / "onfailure-ran"
+    hooks_file = tmp_path / "hooks.json"
+    hooks_file.write_text(
+        json.dumps(
+            {
+                "onFailure": [
+                    {
+                        "path": sys.executable,
+                        "args": ["-c", f"open({str(marker)!r}, 'w').close()"],
+                        "blockOnFailure": False,
+                        "environment": {},
+                        "environmentFile": None,
+                    }
+                ],
+            }
+        )
+    )
+
+    main.run_on_failure(
+        str(hooks_file),
+        str(tmp_path / "context.json"),  # missing -> _recover_last_context's own default path
+        lockdown_path=str(lockdown_path),
+        host="127.0.0.1",
+        port="1",  # nothing listens on port 1 -- the connect itself must fail
+    )
+
+    assert marker.exists()
+
+
 def test_run_processes_many_databases_correctly_under_real_concurrency(
     pg_dsn: str, admin_conn: psycopg.Connection
 ) -> None:
@@ -1112,6 +1152,37 @@ def test_run_processes_many_databases_correctly_under_real_concurrency(
     finally:
         for name in all_names:
             admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_run_exception_during_per_database_processing_does_not_crash_the_whole_run(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test: round 2 only hook-proofed _process_database --
+    the real Postgres work beside the hooks (lock decision,
+    collation.process_database, partition repair) had no exception
+    guard, so a raise there still crashed run() via future.result(),
+    losing every other database's already-completed work."""
+    host, port = _host_port(pg_dsn)
+    real_process_database = collation.process_database
+
+    def boom(conn: psycopg.Connection) -> collation.DatabaseResult:
+        if conn.info.dbname == "template1":
+            raise RuntimeError("boom")
+        return real_process_database(conn)
+
+    monkeypatch.setattr(collation, "process_database", boom)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+    )
+
+    assert not report.success
+    assert "template1" not in report.databases_processed
+    assert "postgres" in report.databases_processed
 
 
 def test_main_passes_max_parallel_databases_env_var_to_run(

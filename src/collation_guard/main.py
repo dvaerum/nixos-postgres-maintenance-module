@@ -200,22 +200,38 @@ def _process_database(
             locked = locked or bool(partitions.partition_repair_candidates(conn))
         return locked
 
-    with _locked_connection(host, port, dbname, manager, needs_lock) as conn:
-        collation_result = collation.process_database(conn)
-        collation_ok = _apply_collation_result(collation_result, dbname, report)
-        partition_ok = True
-        if partition_repair_enabled:
-            partition_ok = _apply_partition_repair(conn, dbname, max_attempts, report)
+    # Everything below -- the lock decision, the actual collation/
+    # partition work -- runs inside a ThreadPoolExecutor worker (see
+    # run()). An uncaught exception here would propagate out via
+    # future.result(), crashing the whole run and silently dropping
+    # every other database's already-completed work (the same failure
+    # mode round 2 fixed for hook invocation specifically; this is the
+    # rest of the function).
+    reindexed: list[str] = []
+    try:
+        with _locked_connection(host, port, dbname, manager, needs_lock) as conn:
+            collation_result = collation.process_database(conn)
+            collation_ok = _apply_collation_result(collation_result, dbname, report)
+            reindexed = collation_result.reindexed
+            partition_ok = True
+            if partition_repair_enabled:
+                partition_ok = _apply_partition_repair(conn, dbname, max_attempts, report)
+        report.databases_processed.append(dbname)
+        ok = collation_ok and partition_ok
+    except Exception as exc:
+        logger.warning("%s: processing raised: %s", dbname, exc)
+        report.failures.append(
+            Failure(database=dbname, relation=dbname, error=f"processing raised: {exc}")
+        )
+        ok = False
 
-    report.databases_processed.append(dbname)
-
-    if collation_ok and partition_ok:
+    if ok:
         _run_hooks(
             hooks.per_database.on_success,
             "database_success",
             report,
             database=dbname,
-            context={"reindexed": collation_result.reindexed},
+            context={"reindexed": reindexed},
         )
     else:
         error = "; ".join(f"{f.relation}: {f.error}" for f in report.failures)
@@ -485,12 +501,27 @@ def run_on_failure(
     Also unconditionally cleans up a lockdown file left behind by a
     crash mid-lock, independent of any configured onFailure hooks --
     see lockdown.cleanup_lockdown_file(). A no-op when lockdown_path is
-    None (connectionLockdown.enable = false)."""
+    None (connectionLockdown.enable = false).
+
+    Both this cleanup step and loading the hooks file are wrapped
+    defensively: this entry point's whole purpose is "run the
+    configured onFailure hooks no matter what," so a failure in its
+    own best-effort setup (Postgres itself unreachable -- exactly the
+    scenario that triggers this unit when postgresql.service fails to
+    start -- or a corrupt hooks file) must not prevent that."""
     if lockdown_path is not None:
         assert host is not None and port is not None
-        lockdown.cleanup_lockdown_file(host, port, lockdown_path)
+        try:
+            lockdown.cleanup_lockdown_file(host, port, lockdown_path)
+        except Exception as exc:
+            logger.warning("lockdown cleanup during --on-failure raised: %s", exc)
 
-    hooks = load_hooks(hooks_file)
+    try:
+        hooks = load_hooks(hooks_file)
+    except Exception as exc:
+        logger.warning("failed to load hooks file during --on-failure: %s", exc)
+        return 1
+
     context, error = _recover_last_context(context_file)
     report = RunReport()
     _run_hooks(hooks.on_failure, "on_failure", report, context=context, error=error)
