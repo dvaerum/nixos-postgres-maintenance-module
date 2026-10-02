@@ -229,7 +229,7 @@ nix flake check      # fast tier + slow (systemd-nspawn) tier + the Nix package 
 nix build .#icuDriftTest -L   # heaviest tier: real ICU-drift test, two full Postgres
                                # rebuilds -- not part of `nix flake check`/CI, see
                                # docs/decisions/0008; run by hand only
-nix fmt              # format both Nix and Python
+nix fmt              # format Nix files (nixfmt-rfc-style) -- no Python formatter is wired in
 nix-build generate-doc.nix && cp result docs/options.md   # regenerate the option reference
 ```
 

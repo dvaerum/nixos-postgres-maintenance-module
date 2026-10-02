@@ -40,7 +40,9 @@ docs/learnings/       cross-cutting operational knowledge, not tied to one decis
   `pytest`, `ruff`, `mypy`, `postgresql` all on `PATH`).
 - Gate before committing: `pytest`, `ruff check .`, `mypy`, and
   `nix flake check` (runs the Nix-level build + both test tiers).
-- `nix fmt` covers both Nix and Python formatting.
+- `nix fmt` formats Nix only (`nixfmt-rfc-style`, flake.nix's sole
+  `formatter`) -- there's no Python formatter wired in; `ruff check .`
+  in the gate above only lints, it doesn't reformat.
 
 ## Versioning
 
