@@ -161,6 +161,76 @@ def test_run_hook_failure_path_does_not_raise(tmp_path):
     assert result.block_on_failure is True
 
 
+@pytest.mark.parametrize(
+    "stage,database,context,error,expected_vars",
+    [
+        ("pre_start", None, {}, None, {"COLLATION_GUARD_STAGE", "COLLATION_GUARD_CONTEXT"}),
+        ("on_success", None, {}, None, {"COLLATION_GUARD_STAGE", "COLLATION_GUARD_CONTEXT"}),
+        (
+            "on_failure",
+            None,
+            {},
+            "boom",
+            {"COLLATION_GUARD_STAGE", "COLLATION_GUARD_CONTEXT", "COLLATION_GUARD_ERROR"},
+        ),
+        (
+            "post_run",
+            None,
+            {},
+            "boom",
+            {"COLLATION_GUARD_STAGE", "COLLATION_GUARD_CONTEXT", "COLLATION_GUARD_ERROR"},
+        ),
+        (
+            "database_pre_start",
+            "db",
+            {},
+            None,
+            {"COLLATION_GUARD_STAGE", "COLLATION_GUARD_DATABASE", "COLLATION_GUARD_CONTEXT"},
+        ),
+        (
+            "database_success",
+            "db",
+            {},
+            None,
+            {"COLLATION_GUARD_STAGE", "COLLATION_GUARD_DATABASE", "COLLATION_GUARD_CONTEXT"},
+        ),
+        (
+            "database_failure",
+            "db",
+            {},
+            "boom",
+            {
+                "COLLATION_GUARD_STAGE",
+                "COLLATION_GUARD_DATABASE",
+                "COLLATION_GUARD_CONTEXT",
+                "COLLATION_GUARD_ERROR",
+            },
+        ),
+    ],
+)
+def test_run_hook_sets_exactly_the_reserved_vars_for_each_stage(
+    tmp_path, stage, database, context, error, expected_vars
+):
+    """Cross-checks hooks.py's actual runtime vars against
+    nixosModule/validate-hook.nix's reservedVarsFor and
+    tests/validate-hook.nix's independent table -- all three encode
+    the same mapping by hand; this is the Python half of that
+    cross-check, so a drift between any of them fails a test on at
+    least one side instead of silently diverging."""
+    script = tmp_path / "dump_env.py"
+    out = tmp_path / "out.json"
+    script.write_text(
+        "import os, json, sys\n"
+        "json.dump([k for k in os.environ if k.startswith('COLLATION_GUARD_')], "
+        "open(sys.argv[1], 'w'))\n"
+    )
+    hook = Hook(path=sys.executable, args=[str(script), str(out)])
+
+    run_hook(hook, stage=stage, database=database, context=context, error=error)
+
+    assert set(json.loads(out.read_text())) == expected_vars
+
+
 def _hook_json(path: str = "/bin/true", block_on_failure: bool = True) -> dict:
     return {
         "path": path,

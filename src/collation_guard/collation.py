@@ -211,20 +211,35 @@ def reindex_all_user_tables(conn: psycopg.Connection) -> DatabaseResult:
     return DatabaseResult(reindexed=reindexed, failed=failed)
 
 
-def process_database(conn: psycopg.Connection) -> DatabaseResult:
+def process_database(
+    conn: psycopg.Connection, *, already_reindexed: bool = False
+) -> DatabaseResult:
     """Check and repair the connection's current database's
     Postgres-tracked collation versions. Only refreshes the recorded
     version(s) once every table reindexed cleanly: a partial failure
     means the database's content hasn't been fully verified under the
     current collation, so its recorded version should stay stale, not
     be marked current on a technicality.
+
+    `already_reindexed=True` is for a database whose tables were just
+    reindexed by a *different* trigger in the same run -- main.py's
+    glibc-stamp phase, which reindexes every C.UTF-8 database
+    unconditionally. A database can be C.UTF-8-default *and* have a
+    separately-stale named collation at once (a normal configuration),
+    so without this, both triggers would independently reindex the
+    same tables. Skips the redundant REINDEX pass but still performs
+    the version refresh below, since the glibc-stamp phase never does
+    that for a named collation -- only process_database() does.
     """
     if not is_database_stale(conn):
         return DatabaseResult()
 
     stale_collations = stale_named_collations(conn)
-    result = reindex_all_user_tables(conn)
-    reindexed, failed = result.reindexed, result.failed
+    if already_reindexed:
+        reindexed, failed = [], []
+    else:
+        result = reindex_all_user_tables(conn)
+        reindexed, failed = result.reindexed, result.failed
 
     if not failed:
         refresh_error: str | None = None

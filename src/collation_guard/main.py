@@ -172,6 +172,7 @@ def _process_database(
     max_attempts: int,
     hooks: HooksConfig,
     manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
+    glibc_reindexed: bool = False,
 ) -> RunReport:
     """Processes one database in complete isolation, returning its own
     RunReport rather than mutating a shared one -- lets run() call this
@@ -210,7 +211,9 @@ def _process_database(
     reindexed: list[str] = []
     try:
         with _locked_connection(host, port, dbname, manager, needs_lock) as conn:
-            collation_result = collation.process_database(conn)
+            collation_result = collation.process_database(
+                conn, already_reindexed=glibc_reindexed
+            )
             collation_ok = _apply_collation_result(collation_result, dbname, report)
             reindexed = collation_result.reindexed
             partition_ok = True
@@ -255,11 +258,17 @@ def _process_glibc_stamp(
     glibc_locales_path: str,
     report: RunReport,
     manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
-) -> None:
+) -> set[str]:
+    """Returns the set of databases cleanly reindexed here -- not ones
+    recorded as a failure, which still get a normal retry via
+    _process_database below -- so a database that's ALSO
+    independently stale via a named collation (a database can be both
+    at once) isn't reindexed a second time for work this phase already
+    did; see collation.process_database's already_reindexed param."""
     with _connect(host, port, "postgres") as admin_conn:
         stamp = collation.glibc_stamp(admin_conn)
         if stamp == glibc_locales_path:
-            return
+            return set()
 
         logger.info(
             "glibc locale data changed (%s -> %s), reindexing C.UTF-8 databases",
@@ -268,6 +277,7 @@ def _process_glibc_stamp(
         )
         c_utf8_dbs = collation.c_utf8_databases(admin_conn)
         all_ok = True
+        cleanly_reindexed: set[str] = set()
         for dbname in c_utf8_dbs:
             # Connect BEFORE locking, same pattern as _process_database
             # -- a new connection attempt made AFTER dbname is already
@@ -289,15 +299,19 @@ def _process_glibc_stamp(
             # genuinely gets reindexed.
             with _locked_connection(host, port, dbname, manager, lambda _conn: True) as conn:
                 result = collation.reindex_all_user_tables(conn)
-                if not _apply_collation_result(
+                if _apply_collation_result(
                     result, dbname, report, error_suffix=" (C.UTF-8 stamp check)"
                 ):
+                    cleanly_reindexed.add(dbname)
+                else:
                     all_ok = False
 
         # Only advance the stamp once every C.UTF-8 database reindexed
         # cleanly -- otherwise the next run must retry, not silently skip.
         if all_ok:
             collation.set_glibc_stamp(admin_conn, glibc_locales_path)
+
+        return cleanly_reindexed
 
 
 # Failure.database value for a failure that isn't about any specific
@@ -383,6 +397,21 @@ def run(
 ) -> RunReport:
     report = RunReport()
     hooks = hooks or HooksConfig()
+
+    if dry_run:
+        # No LockdownManager here -- a real one would open its own
+        # admin connection and spawn a background thread (see
+        # lockdown.py) purely to sit unused: dry-run never locks
+        # anything, and COLLATION_GUARD_LOCKDOWN_FILE is always set in
+        # production regardless of connectionLockdown.enable.
+        with _connect(host, port, "postgres") as admin_conn:
+            databases = collation.connectable_databases(admin_conn)
+        for dbname in databases:
+            with _connect(host, port, dbname) as conn:
+                for schema, table in partitions.partition_repair_candidates(conn):
+                    print(f"{dbname}.{schema}.{table}")
+        return report
+
     manager: lockdown.LockdownManager | lockdown.NullLockdownManager = (
         lockdown.LockdownManager(host, port, lockdown_path)
         if lockdown_path is not None and connection_lockdown_enabled
@@ -390,28 +419,20 @@ def run(
     )
 
     try:
-        if not dry_run and not _run_hooks(
+        if not _run_hooks(
             hooks.pre_start, "pre_start", report, context=_report_context(report)
         ):
             return report
 
         with _connect(host, port, "postgres") as admin_conn:
             databases = collation.connectable_databases(admin_conn)
-
-            if dry_run:
-                for dbname in databases:
-                    with _connect(host, port, dbname) as conn:
-                        for schema, table in partitions.partition_repair_candidates(conn):
-                            print(f"{dbname}.{schema}.{table}")
-                return report
-
             template0_error = collation.process_template0(admin_conn)
             if template0_error is not None:
                 report.failures.append(
                     Failure(database="template0", relation="template0", error=template0_error)
                 )
 
-        _process_glibc_stamp(host, port, glibc_locales_path, report, manager)
+        glibc_reindexed = _process_glibc_stamp(host, port, glibc_locales_path, report, manager)
 
         # Each worker gets its own psycopg.Connection and its own
         # RunReport (see _process_database's docstring) -- no shared
@@ -430,6 +451,7 @@ def run(
                     max_repair_attempts,
                     hooks,
                     manager,
+                    dbname in glibc_reindexed,
                 )
                 for dbname in sorted(databases)
             ]

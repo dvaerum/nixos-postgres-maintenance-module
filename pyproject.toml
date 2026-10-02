@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "collation-guard"
-version = "0.4.6"
+version = "0.4.7"
 description = "Postgres collation-drift guard for NixOS: per-relation reindex, C.UTF-8 stamping, and text-partition repair"
 readme = "README.md"
 license = "MIT"

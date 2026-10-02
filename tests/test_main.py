@@ -1165,10 +1165,12 @@ def test_run_exception_during_per_database_processing_does_not_crash_the_whole_r
     host, port = _host_port(pg_dsn)
     real_process_database = collation.process_database
 
-    def boom(conn: psycopg.Connection) -> collation.DatabaseResult:
+    def boom(
+        conn: psycopg.Connection, *, already_reindexed: bool = False
+    ) -> collation.DatabaseResult:
         if conn.info.dbname == "template1":
             raise RuntimeError("boom")
-        return real_process_database(conn)
+        return real_process_database(conn, already_reindexed=already_reindexed)
 
     monkeypatch.setattr(collation, "process_database", boom)
 
@@ -1183,6 +1185,51 @@ def test_run_exception_during_per_database_processing_does_not_crash_the_whole_r
     assert not report.success
     assert "template1" not in report.databases_processed
     assert "postgres" in report.databases_processed
+
+
+def test_apply_collation_result_marks_repaired_and_logs_on_reindexed() -> None:
+    """Direct unit test for a pure, dependency-free function -- round
+    1 extracted _apply_collation_result specifically to be the one
+    shared mapper from DatabaseResult to RunReport entries, but
+    nothing exercised it directly afterward; every case was only
+    reachable transitively through a real-cluster run()-level test."""
+    report = main.RunReport()
+    result = collation.DatabaseResult(reindexed=["widgets"], failed=[])
+
+    ok = main._apply_collation_result(result, "mydb", report)
+
+    assert ok is True
+    assert report.databases_repaired == ["mydb"]
+    assert report.failures == []
+
+
+def test_apply_collation_result_appends_failure_per_failed_table_with_suffix() -> None:
+    report = main.RunReport()
+    result = collation.DatabaseResult(reindexed=[], failed=["widgets", "gadgets"])
+
+    ok = main._apply_collation_result(
+        result, "mydb", report, error_suffix=" (C.UTF-8 stamp check)"
+    )
+
+    assert ok is False
+    assert [f.error for f in report.failures] == [
+        "REINDEX failed (C.UTF-8 stamp check)",
+        "REINDEX failed (C.UTF-8 stamp check)",
+    ]
+    assert report.databases_repaired == []
+
+
+def test_apply_collation_result_appends_refresh_error_failure() -> None:
+    report = main.RunReport()
+    result = collation.DatabaseResult(
+        reindexed=["widgets"], failed=[], refresh_error="invalid collation version change"
+    )
+
+    ok = main._apply_collation_result(result, "mydb", report)
+
+    assert ok is False
+    assert report.databases_repaired == ["mydb"]  # the reindex itself succeeded
+    assert any(f.error == "invalid collation version change" for f in report.failures)
 
 
 def test_main_passes_max_parallel_databases_env_var_to_run(
@@ -1262,6 +1309,61 @@ def test_run_dedupes_databases_repaired_across_glibc_stamp_and_worker_paths(
 
         assert report.success
         assert report.databases_repaired.count(name) == 1
+    finally:
+        with psycopg.connect(
+            f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
+        ) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_run_does_not_reindex_twice_for_a_database_both_glibc_and_named_collation_stale(
+    c_utf8_pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A C.UTF-8-default database can ALSO have a separately-stale
+    named (e.g. ICU) collation object -- a normal, supported Postgres
+    configuration. Before this fix, _process_glibc_stamp's
+    unconditional reindex (triggered by the C.UTF-8 default) and
+    _process_database's own is_database_stale-triggered reindex
+    (triggered by the named collation) both fired for the same
+    database, reindexing every user table twice."""
+    host, port = _host_port(c_utf8_pg_dsn)
+    name = "cg_main_test_glibc_and_named_collation_dup"
+    with psycopg.connect(
+        f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
+    ) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin.execute(f'CREATE DATABASE "{name}"')  # inherits the cluster's C.UTF-8 default
+
+    with psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None) as conn:
+        conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text)")
+        conn.execute("CREATE COLLATION cg_test_collation (locale = 'en_US.UTF-8')")
+        conn.commit()
+        conn.execute(
+            "UPDATE pg_collation SET collversion = 'not-the-real-version' "
+            "WHERE collname = 'cg_test_collation'"
+        )
+        conn.commit()
+
+    call_counts: dict[str, int] = {}
+    real_reindex = collation.reindex_all_user_tables
+
+    def counting_reindex(conn: psycopg.Connection) -> collation.DatabaseResult:
+        call_counts[conn.info.dbname] = call_counts.get(conn.info.dbname, 0) + 1
+        return real_reindex(conn)
+
+    monkeypatch.setattr(collation, "reindex_all_user_tables", counting_reindex)
+
+    try:
+        report = main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-and-named-collation-dup",
+            partition_repair_enabled=False,
+            max_repair_attempts=10,
+        )
+
+        assert report.success
+        assert call_counts.get(name) == 1
     finally:
         with psycopg.connect(
             f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None

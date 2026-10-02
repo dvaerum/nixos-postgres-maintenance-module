@@ -21,6 +21,7 @@ from collation_guard.collation import (
     process_database,
     process_template0,
     set_glibc_stamp,
+    stale_named_collations,
     template0_collation_is_stale,
 )
 
@@ -113,6 +114,36 @@ def test_process_database_reindexes_and_refreshes_on_mismatch(pg_dsn: str, test_
         assert result.reindexed == ["widgets"]
         assert result.failed == []
         assert not database_collation_is_stale(conn)
+
+
+def test_process_database_with_already_reindexed_skips_reindex_but_still_refreshes_named_collation(
+    pg_dsn: str, test_db: str
+) -> None:
+    """already_reindexed=True is for a database whose tables were just
+    reindexed by a DIFFERENT trigger in the same run (the glibc-stamp
+    phase -- see main.py's double-reindex fix) -- process_database
+    must not reindex them again, but must still refresh the stale
+    named collation's own recorded version, since that's the one thing
+    the other trigger doesn't do."""
+    with _connect(pg_dsn, test_db) as conn:
+        conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text)")
+        conn.commit()
+        conn.execute("CREATE COLLATION cg_test_collation (locale = 'en_US.UTF-8')")
+        conn.commit()
+        conn.execute(
+            "UPDATE pg_collation SET collversion = 'not-the-real-version' "
+            "WHERE collname = 'cg_test_collation'"
+        )
+        conn.commit()
+
+        assert is_database_stale(conn)
+
+        result = process_database(conn, already_reindexed=True)
+
+        assert result.ok
+        assert result.reindexed == []
+        assert result.failed == []
+        assert not stale_named_collations(conn)
 
 
 def test_process_database_reindex_skips_partitioned_parent(pg_dsn: str, test_db: str) -> None:
