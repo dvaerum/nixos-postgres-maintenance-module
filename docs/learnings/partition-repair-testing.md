@@ -5,18 +5,12 @@ the *same* collation's comparison behavior changed between the row's
 last validation and now (a real glibc/ICU library version change).
 That can't be reproduced in a single-locale test sandbox, and -- this
 took real effort to confirm -- there is no SQL/tool-level shortcut
-either:
+either. The `ATTACH PARTITION` dead end -- its unavoidable
+re-validation scan, and why a `NOT VALID` `CHECK` constraint doesn't
+suppress it -- is covered in full in
+`docs/decisions/0004-cross-partition-update-for-partition-repair.md`;
+the other avenue ruled out, not covered there:
 
-- `ATTACH PARTITION` always re-scans and validates every row against
-  the new bound; there is no way to make it skip a genuinely violating
-  row.
-- A matching `NOT VALID` `CHECK` constraint does **not** make `ATTACH
-  PARTITION` skip that scan. The real, documented optimization
-  (`ADD CONSTRAINT ... CHECK (...) NOT VALID` then `VALIDATE
-  CONSTRAINT` before attaching) only avoids a second, redundant scan --
-  the explicit `VALIDATE CONSTRAINT` step still scans and still rejects
-  a genuinely bad row. There is no bypass, by design: letting one exist
-  would be a real correctness hole in partitioning itself.
 - `pg_surgery` -- the real contrib extension built for forcing
   corruption-repair writes into a heap -- only ships
   `heap_force_freeze`/`heap_force_kill` in this nixpkgs build, not a

@@ -34,7 +34,7 @@ class Failure:
 class RunReport:
     """Outcome of one full run, across every database in the cluster --
     also the shape written to COLLATION_GUARD_CONTEXT_FILE for hooks
-    (see nixosModule/options.nix) to read."""
+    (see nixosModule/config.nix) to read."""
 
     databases_processed: list[str] = field(default_factory=list)
     databases_repaired: list[str] = field(default_factory=list)
@@ -540,7 +540,11 @@ def run_on_failure(
     Also unconditionally cleans up a lockdown file left behind by a
     crash mid-lock, independent of any configured onFailure hooks --
     see lockdown.cleanup_lockdown_file(). A no-op when lockdown_path is
-    None (connectionLockdown.enable = false).
+    None -- not a production case, since the on-failure unit's own
+    COLLATION_GUARD_LOCKDOWN_FILE is set regardless of
+    connectionLockdown.enable (see run()'s dry-run branch above for the
+    same fact); only a direct/test invocation without that env var set
+    hits this branch.
 
     Both this cleanup step and loading the hooks file are wrapped
     defensively: this entry point's whole purpose is "run the

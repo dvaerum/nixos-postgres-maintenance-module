@@ -9,8 +9,9 @@
 let
   # Mirrors run_hook()'s default_vars (src/collation_guard/hooks.py):
   # STAGE is set for every invocation; DATABASE only for perDatabase.*
-  # stages; ERROR only for the two failure-reporting stages. Keep this
-  # in lockstep with that function if a new default var is ever added.
+  # stages; ERROR only for the three failure-reporting stages (onFailure,
+  # postRun, perDatabase.onFailure). Keep this in lockstep with that
+  # function if a new default var is ever added.
   reservedVarsFor =
     optionPath:
     [
