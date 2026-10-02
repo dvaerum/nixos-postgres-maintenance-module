@@ -179,7 +179,13 @@ def _process_database(
     from multiple threads (one per database) with no locking: each
     worker only ever touches its own report, and run() merges every
     worker's result into the real report sequentially, back in the
-    main thread, once every worker has finished."""
+    main thread, once every worker has finished.
+
+    Contrast with _process_glibc_stamp: that phase runs once,
+    sequentially, before the ThreadPoolExecutor starts, so it mutates
+    the shared report directly -- there's no concurrent writer to race
+    against. A new phase function should follow whichever convention
+    matches where it actually runs, not copy this one by default."""
     report = RunReport()
 
     if not _run_hooks(
@@ -208,7 +214,6 @@ def _process_database(
     # every other database's already-completed work (the same failure
     # mode round 2 fixed for hook invocation specifically; this is the
     # rest of the function).
-    reindexed: list[str] = []
     try:
         with _locked_connection(host, port, dbname, manager, needs_lock) as conn:
             collation_result = collation.process_database(
@@ -259,7 +264,14 @@ def _process_glibc_stamp(
     report: RunReport,
     manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
 ) -> set[str]:
-    """Returns the set of databases cleanly reindexed here -- not ones
+    """Runs once, sequentially, before run()'s ThreadPoolExecutor
+    starts -- mutates the shared `report` directly (same as run()'s
+    own template0/pre_start handling), which is safe here specifically
+    because nothing else is writing to it concurrently yet. Contrast
+    with _process_database, which is isolated for exactly the opposite
+    reason (see its own docstring).
+
+    Returns the set of databases cleanly reindexed here -- not ones
     recorded as a failure, which still get a normal retry via
     _process_database below -- so a database that's ALSO
     independently stale via a named collation (a database can be both

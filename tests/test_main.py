@@ -1369,3 +1369,64 @@ def test_run_does_not_reindex_twice_for_a_database_both_glibc_and_named_collatio
             f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
         ) as admin:
             admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_run_glibc_stamp_reindex_failure_does_not_mark_database_already_reindexed(
+    c_utf8_pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the cleanly_reindexed branch (main.py's
+    _process_glibc_stamp): a database whose C.UTF-8-triggered reindex
+    FAILS must still be retried (not skipped as already_reindexed) by
+    the later, named-collation-triggered pass. Round 3's own double-
+    reindex test only proved the all-succeed path -- confirmed nothing
+    would previously catch that branch's if/else being swapped."""
+    host, port = _host_port(c_utf8_pg_dsn)
+    name = "cg_main_test_glibc_partial_failure_retry"
+    with psycopg.connect(
+        f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
+    ) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin.execute(f'CREATE DATABASE "{name}"')
+
+    with psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None) as conn:
+        conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, name text)")
+        conn.execute("CREATE COLLATION cg_test_collation (locale = 'en_US.UTF-8')")
+        conn.commit()
+        conn.execute(
+            "UPDATE pg_collation SET collversion = 'not-the-real-version' "
+            "WHERE collname = 'cg_test_collation'"
+        )
+        conn.commit()
+
+    call_counts: dict[str, int] = {}
+    already_failed_once = {name: False}
+    real_reindex = collation.reindex_all_user_tables
+
+    def flaky_reindex(conn: psycopg.Connection) -> collation.DatabaseResult:
+        dbname = conn.info.dbname
+        call_counts[dbname] = call_counts.get(dbname, 0) + 1
+        if dbname == name and not already_failed_once[name]:
+            already_failed_once[name] = True
+            return collation.DatabaseResult(reindexed=[], failed=["widgets"])
+        return real_reindex(conn)
+
+    monkeypatch.setattr(collation, "reindex_all_user_tables", flaky_reindex)
+
+    try:
+        main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-partial-failure-retry",
+            partition_repair_enabled=False,
+            max_repair_attempts=10,
+        )
+
+        # The glibc-stamp phase's own attempt failed -- a second,
+        # genuine attempt via _process_database must have happened
+        # (not been skipped as already_reindexed).
+        assert call_counts.get(name) == 2
+    finally:
+        with psycopg.connect(
+            f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
+        ) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{name}"')

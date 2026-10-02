@@ -148,7 +148,7 @@ services.postgresqlCollationGuard.hooks.perDatabase.onFailure = [
 ```
 
 Every hook gets `COLLATION_GUARD_STAGE` (always), `COLLATION_GUARD_DATABASE`
-(the four `database_*` stages), `COLLATION_GUARD_ERROR` (a plain
+(the three `database_*` stages), `COLLATION_GUARD_ERROR` (a plain
 one-line summary, no JSON parsing needed, on failure-shaped stages),
 and `COLLATION_GUARD_CONTEXT` — always present, always valid JSON, on
 every single stage (an empty `{}` where there's nothing yet to report,
