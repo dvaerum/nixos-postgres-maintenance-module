@@ -14,11 +14,7 @@ import pytest
 
 from collation_guard import collation, main, partitions
 from collation_guard.hooks import Hook, HooksConfig, PerDatabaseHooks
-
-
-def _host_port(pg_dsn: str) -> tuple[str, str]:
-    parts = dict(item.split("=", 1) for item in pg_dsn.split())
-    return parts["host"], parts["port"]
+from conftest import _host_port
 
 
 @pytest.fixture

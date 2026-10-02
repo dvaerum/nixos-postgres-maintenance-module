@@ -43,6 +43,10 @@ class LockdownManager:
         self._locked: set[str] = set()
         self._queue: queue.Queue[_LockRequest | None] = queue.Queue()
         self._error: Exception | None = None
+        # Guards self._error together with the queue put/drain that
+        # must stay atomic with it -- see _submit()/_run()'s own
+        # comments for the exact race this closes.
+        self._state_lock = threading.Lock()
         # One dedicated connection, used only by this thread -- tagged
         # the same as every other guard connection so the termination
         # sweep below can tell it apart from a connection this manager
@@ -71,10 +75,22 @@ class LockdownManager:
         self._conn.close()
 
     def _submit(self, dbname: str, action: str) -> None:
-        if self._error is not None:
-            raise self._error
-        request = _LockRequest(dbname, action)
-        self._queue.put(request)
+        # Checking self._error and enqueuing must be one atomic step:
+        # without the lock, a caller could pass the check just before
+        # a failure, then not actually enqueue until AFTER _run()'s
+        # except-branch has already drained the (then-empty) queue and
+        # exited -- orphaning the request forever (done.wait() below
+        # has no timeout). Whichever of this or _run()'s except-branch
+        # acquires the lock first is guaranteed to fully happen before
+        # the other: either the enqueue lands before the drain (so the
+        # drain finds and releases it), or the error is set and the
+        # drain completes before this check runs (so the check catches
+        # it and never enqueues at all).
+        with self._state_lock:
+            if self._error is not None:
+                raise self._error
+            request = _LockRequest(dbname, action)
+            self._queue.put(request)
         request.done.wait()
         if self._error is not None:
             raise self._error
@@ -102,9 +118,10 @@ class LockdownManager:
                         (request.dbname,),
                     )
             except Exception as exc:
-                self._error = exc
+                with self._state_lock:
+                    self._error = exc
+                    self._drain_with_error()
                 request.done.set()
-                self._drain_with_error()
                 return
             request.done.set()
 

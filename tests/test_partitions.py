@@ -19,6 +19,7 @@ from collation_guard.partitions import (
     repair_partition_table,
     repair_row,
 )
+from conftest import _host_port
 
 
 @pytest.fixture
@@ -26,9 +27,8 @@ def test_db(admin_conn: psycopg.Connection, pg_dsn: str) -> Iterator[psycopg.Con
     name = "cg_test_cycle6"
     admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
     admin_conn.execute(f'CREATE DATABASE "{name}"')
-    parts = dict(item.split("=", 1) for item in pg_dsn.split())
-    dsn = f"host={parts['host']} port={parts['port']} dbname={name}"
-    conn = psycopg.connect(dsn, prepare_threshold=None)
+    host, port = _host_port(pg_dsn)
+    conn = psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None)
     try:
         yield conn
     finally:

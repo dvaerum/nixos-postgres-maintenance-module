@@ -21,6 +21,15 @@ _PORT = 5432  # fixed is fine: the socket lives in a per-session tmpdir,
 # real port to collide on either.
 
 
+def _host_port(dsn: str) -> tuple[str, str]:
+    """Unpacks a psycopg keyword/value DSN string (as yielded by the
+    pg_dsn/c_locale_pg_dsn/c_utf8_pg_dsn fixtures below) into its host
+    and port -- the one place this parse lives, shared by every test
+    file that needs to rebuild a DSN for a different database."""
+    parts = dict(item.split("=", 1) for item in dsn.split())
+    return parts["host"], parts["port"]
+
+
 def _wait_until_ready(dsn: str, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None

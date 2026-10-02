@@ -24,6 +24,7 @@ from collation_guard.collation import (
     stale_named_collations,
     template0_collation_is_stale,
 )
+from conftest import _host_port
 
 
 def _fake_stale(conn: psycopg.Connection, database: str) -> None:
@@ -55,9 +56,8 @@ def test_db(admin_conn: psycopg.Connection, pg_dsn: str) -> Iterator[str]:
 
 
 def _connect(pg_dsn: str, dbname: str) -> psycopg.Connection:
-    parts = dict(item.split("=", 1) for item in pg_dsn.split())
-    dsn = f"host={parts['host']} port={parts['port']} dbname={dbname}"
-    return psycopg.connect(dsn, prepare_threshold=None)
+    host, port = _host_port(pg_dsn)
+    return psycopg.connect(f"host={host} port={port} dbname={dbname}", prepare_threshold=None)
 
 
 def test_is_database_stale_false_when_nothing_tracked_is_stale(pg_dsn: str, test_db: str) -> None:

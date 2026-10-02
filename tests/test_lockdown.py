@@ -16,11 +16,7 @@ import pytest
 
 from collation_guard import lockdown
 from collation_guard.lockdown import LockdownManager, _LockRequest
-
-
-def _host_port(pg_dsn: str) -> tuple[str, str]:
-    parts = dict(item.split("=", 1) for item in pg_dsn.split())
-    return parts["host"], parts["port"]
+from conftest import _host_port
 
 
 @pytest.fixture
@@ -146,6 +142,45 @@ def test_concurrent_lock_unlock_from_multiple_threads_is_race_free(
     finally:
         for name in names:
             admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def test_concurrent_submit_survives_a_mid_stream_failure_without_hanging(
+    manager: LockdownManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stress test for a narrow TOCTOU race in _submit(): the
+    self._error check and the queue enqueue used to be two
+    unsynchronized steps, so a concurrent _submit() could pass its
+    check just before a failure, then not actually enqueue until after
+    the manager thread had already drained the (then-empty) queue and
+    exited -- orphaning that request forever (request.done.wait() has
+    no timeout). Hammers lock()/unlock() from many threads with one
+    reload made to fail partway through; asserts every thread
+    completes (success or a raised error, either is fine) within a
+    bounded time -- a hang is the only failure mode this test can't
+    tell apart from a timeout, which is exactly the point."""
+    real_reload = lockdown._reload_and_confirm
+    call_count = {"n": 0}
+
+    def flaky_reload(conn: psycopg.Connection) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 10:
+            raise RuntimeError("injected failure")
+        real_reload(conn)
+
+    monkeypatch.setattr(lockdown, "_reload_and_confirm", flaky_reload)
+    names = [f"cg_lockdown_test_race_{i}" for i in range(16)]
+
+    def worker(name: str) -> None:
+        try:
+            manager.lock(name)
+            manager.unlock(name)
+        except Exception:
+            pass  # a raised error is fine here -- a hang is not
+
+    with ThreadPoolExecutor(max_workers=len(names)) as executor:
+        futures = [executor.submit(worker, name) for name in names]
+        for f in futures:
+            f.result(timeout=10)  # TimeoutError here = a hang = a real failure
 
 
 def test_lock_terminates_existing_sessions_but_excludes_the_guards_own(
