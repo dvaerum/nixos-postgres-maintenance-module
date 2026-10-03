@@ -165,6 +165,15 @@ services.postgresqlCollationGuard.hooks.perDatabase.onFailure = [
 ];
 ```
 
+`environmentFile` is how the token above reaches the hook safely: only
+its *path* is written into the Nix store, never its contents. Inline
+`environment` values, by contrast, are serialized whole into a
+world-readable store path (`hooksFile` in `nixosModule/config.nix`) --
+fine for non-secret values (a webhook URL, a stage name), never for a
+token, password, or API key. Point `environmentFile` at a decrypted
+sops-nix/agenix secret or equivalent; never at a path checked into a
+repository, which would defeat the purpose just as much as inlining it.
+
 Every hook gets `COLLATION_GUARD_STAGE` (always), `COLLATION_GUARD_DATABASE`
 (the three `database_*` stages), `COLLATION_GUARD_ERROR` (a plain
 one-line summary, no JSON parsing needed, on failure-shaped stages),

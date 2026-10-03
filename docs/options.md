@@ -263,6 +263,13 @@ and always valid JSON, on every stage (an empty ` {} ` where
 there’s nothing yet to report) – no need to check whether it
 exists before parsing it\. See docs/decisions/0006\.
 
+**Never put a secret (token, password, API key) in here\.**
+Every value is serialized by this module into a JSON file
+built into the Nix store – world-readable, and pushed to any
+configured binary cache – regardless of ` connectionLockdown `
+or anything else\. Use ` environmentFile ` below for anything
+sensitive\.
+
 
 
 *Type:*
@@ -285,9 +292,15 @@ attribute set of string
 
 
 
-` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
-path), merged with ` environment ` and the stage’s own default
-variables under the same no-collision rule\.
+` EnvironmentFile `-style ` KEY=VALUE ` file, merged with
+` environment ` and the stage’s own default variables under the
+same no-collision rule\. This is where a secret belongs: only
+the *path* is written into the Nix store, never the file’s
+contents, so point it at a decrypted sops-nix/agenix secret
+(e\.g\. ` config.sops.secrets."my-hook-token".path `) or
+equivalent – never at a plain file checked into this
+repository or a Nix store path itself (which would defeat the
+whole point, since store paths are world-readable)\.
 
 
 
@@ -421,6 +434,13 @@ and always valid JSON, on every stage (an empty ` {} ` where
 there’s nothing yet to report) – no need to check whether it
 exists before parsing it\. See docs/decisions/0006\.
 
+**Never put a secret (token, password, API key) in here\.**
+Every value is serialized by this module into a JSON file
+built into the Nix store – world-readable, and pushed to any
+configured binary cache – regardless of ` connectionLockdown `
+or anything else\. Use ` environmentFile ` below for anything
+sensitive\.
+
 
 
 *Type:*
@@ -443,9 +463,15 @@ attribute set of string
 
 
 
-` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
-path), merged with ` environment ` and the stage’s own default
-variables under the same no-collision rule\.
+` EnvironmentFile `-style ` KEY=VALUE ` file, merged with
+` environment ` and the stage’s own default variables under the
+same no-collision rule\. This is where a secret belongs: only
+the *path* is written into the Nix store, never the file’s
+contents, so point it at a decrypted sops-nix/agenix secret
+(e\.g\. ` config.sops.secrets."my-hook-token".path `) or
+equivalent – never at a plain file checked into this
+repository or a Nix store path itself (which would defeat the
+whole point, since store paths are world-readable)\.
 
 
 
@@ -580,6 +606,13 @@ and always valid JSON, on every stage (an empty ` {} ` where
 there’s nothing yet to report) – no need to check whether it
 exists before parsing it\. See docs/decisions/0006\.
 
+**Never put a secret (token, password, API key) in here\.**
+Every value is serialized by this module into a JSON file
+built into the Nix store – world-readable, and pushed to any
+configured binary cache – regardless of ` connectionLockdown `
+or anything else\. Use ` environmentFile ` below for anything
+sensitive\.
+
 
 
 *Type:*
@@ -602,9 +635,15 @@ attribute set of string
 
 
 
-` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
-path), merged with ` environment ` and the stage’s own default
-variables under the same no-collision rule\.
+` EnvironmentFile `-style ` KEY=VALUE ` file, merged with
+` environment ` and the stage’s own default variables under the
+same no-collision rule\. This is where a secret belongs: only
+the *path* is written into the Nix store, never the file’s
+contents, so point it at a decrypted sops-nix/agenix secret
+(e\.g\. ` config.sops.secrets."my-hook-token".path `) or
+equivalent – never at a plain file checked into this
+repository or a Nix store path itself (which would defeat the
+whole point, since store paths are world-readable)\.
 
 
 
@@ -738,6 +777,13 @@ and always valid JSON, on every stage (an empty ` {} ` where
 there’s nothing yet to report) – no need to check whether it
 exists before parsing it\. See docs/decisions/0006\.
 
+**Never put a secret (token, password, API key) in here\.**
+Every value is serialized by this module into a JSON file
+built into the Nix store – world-readable, and pushed to any
+configured binary cache – regardless of ` connectionLockdown `
+or anything else\. Use ` environmentFile ` below for anything
+sensitive\.
+
 
 
 *Type:*
@@ -760,9 +806,15 @@ attribute set of string
 
 
 
-` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
-path), merged with ` environment ` and the stage’s own default
-variables under the same no-collision rule\.
+` EnvironmentFile `-style ` KEY=VALUE ` file, merged with
+` environment ` and the stage’s own default variables under the
+same no-collision rule\. This is where a secret belongs: only
+the *path* is written into the Nix store, never the file’s
+contents, so point it at a decrypted sops-nix/agenix secret
+(e\.g\. ` config.sops.secrets."my-hook-token".path `) or
+equivalent – never at a plain file checked into this
+repository or a Nix store path itself (which would defeat the
+whole point, since store paths are world-readable)\.
 
 
 
@@ -898,6 +950,13 @@ and always valid JSON, on every stage (an empty ` {} ` where
 there’s nothing yet to report) – no need to check whether it
 exists before parsing it\. See docs/decisions/0006\.
 
+**Never put a secret (token, password, API key) in here\.**
+Every value is serialized by this module into a JSON file
+built into the Nix store – world-readable, and pushed to any
+configured binary cache – regardless of ` connectionLockdown `
+or anything else\. Use ` environmentFile ` below for anything
+sensitive\.
+
 
 
 *Type:*
@@ -920,9 +979,15 @@ attribute set of string
 
 
 
-` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
-path), merged with ` environment ` and the stage’s own default
-variables under the same no-collision rule\.
+` EnvironmentFile `-style ` KEY=VALUE ` file, merged with
+` environment ` and the stage’s own default variables under the
+same no-collision rule\. This is where a secret belongs: only
+the *path* is written into the Nix store, never the file’s
+contents, so point it at a decrypted sops-nix/agenix secret
+(e\.g\. ` config.sops.secrets."my-hook-token".path `) or
+equivalent – never at a plain file checked into this
+repository or a Nix store path itself (which would defeat the
+whole point, since store paths are world-readable)\.
 
 
 
@@ -1057,6 +1122,13 @@ and always valid JSON, on every stage (an empty ` {} ` where
 there’s nothing yet to report) – no need to check whether it
 exists before parsing it\. See docs/decisions/0006\.
 
+**Never put a secret (token, password, API key) in here\.**
+Every value is serialized by this module into a JSON file
+built into the Nix store – world-readable, and pushed to any
+configured binary cache – regardless of ` connectionLockdown `
+or anything else\. Use ` environmentFile ` below for anything
+sensitive\.
+
 
 
 *Type:*
@@ -1079,9 +1151,15 @@ attribute set of string
 
 
 
-` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
-path), merged with ` environment ` and the stage’s own default
-variables under the same no-collision rule\.
+` EnvironmentFile `-style ` KEY=VALUE ` file, merged with
+` environment ` and the stage’s own default variables under the
+same no-collision rule\. This is where a secret belongs: only
+the *path* is written into the Nix store, never the file’s
+contents, so point it at a decrypted sops-nix/agenix secret
+(e\.g\. ` config.sops.secrets."my-hook-token".path `) or
+equivalent – never at a plain file checked into this
+repository or a Nix store path itself (which would defeat the
+whole point, since store paths are world-readable)\.
 
 
 
@@ -1215,6 +1293,13 @@ and always valid JSON, on every stage (an empty ` {} ` where
 there’s nothing yet to report) – no need to check whether it
 exists before parsing it\. See docs/decisions/0006\.
 
+**Never put a secret (token, password, API key) in here\.**
+Every value is serialized by this module into a JSON file
+built into the Nix store – world-readable, and pushed to any
+configured binary cache – regardless of ` connectionLockdown `
+or anything else\. Use ` environmentFile ` below for anything
+sensitive\.
+
 
 
 *Type:*
@@ -1237,9 +1322,15 @@ attribute set of string
 
 
 
-` EnvironmentFile `-style ` KEY=VALUE ` file (e\.g\. a sops secret
-path), merged with ` environment ` and the stage’s own default
-variables under the same no-collision rule\.
+` EnvironmentFile `-style ` KEY=VALUE ` file, merged with
+` environment ` and the stage’s own default variables under the
+same no-collision rule\. This is where a secret belongs: only
+the *path* is written into the Nix store, never the file’s
+contents, so point it at a decrypted sops-nix/agenix secret
+(e\.g\. ` config.sops.secrets."my-hook-token".path `) or
+equivalent – never at a plain file checked into this
+repository or a Nix store path itself (which would defeat the
+whole point, since store paths are world-readable)\.
 
 
 
