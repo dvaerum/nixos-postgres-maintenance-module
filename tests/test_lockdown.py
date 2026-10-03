@@ -75,6 +75,53 @@ def test_lock_two_databases_unlock_one_leaves_the_other_locked(
         admin_conn.execute("DROP ROLE IF EXISTS cg_lockdown_test_role2")
 
 
+def test_hba_quote_escapes_embedded_quotes_and_rejects_newlines() -> None:
+    """pg_hba.conf's own tokenizer (hba.c's next_token()): a quoted
+    field treats comma/whitespace as literal, and "" as an escaped
+    literal quote -- confirmed against the real Postgres source, not
+    assumed."""
+    assert lockdown._hba_quote("plain") == '"plain"'
+    assert lockdown._hba_quote('has"quote') == '"has""quote"'
+    assert lockdown._hba_quote("has,comma") == '"has,comma"'
+    assert lockdown._hba_quote("has space") == '"has space"'
+    with pytest.raises(ValueError):
+        lockdown._hba_quote("has\nnewline")
+
+
+def test_lock_database_name_containing_a_comma_is_not_silently_evaded(
+    manager: LockdownManager, pg_dsn: str, admin_conn: psycopg.Connection
+) -> None:
+    """Security regression: pg_hba.conf's database field is itself
+    comma-separated. Before _hba_quote(), a database literally named
+    with a comma would never be matched by any token in an unquoted
+    list -- silently evading its own lockdown -- and the comma could
+    also misroute to an unrelated database sharing one of the split
+    tokens as its own name. Real reproduction via an actual connection
+    attempt, not just a unit test of the quoting helper."""
+    host, port = _host_port(pg_dsn)
+    tricky_name = "cg_lockdown_test_tricky,cg_lockdown_test_sibling"
+    sibling_name = "cg_lockdown_test_sibling"
+    for name in (tricky_name, sibling_name):
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute(f'CREATE DATABASE "{name}"')
+    admin_conn.execute("DROP ROLE IF EXISTS cg_lockdown_test_role3")
+    admin_conn.execute("CREATE ROLE cg_lockdown_test_role3 LOGIN")
+    admin_conn.execute(f'GRANT CONNECT ON DATABASE "{tricky_name}" TO cg_lockdown_test_role3')
+    admin_conn.execute(f'GRANT CONNECT ON DATABASE "{sibling_name}" TO cg_lockdown_test_role3')
+    try:
+        manager.lock(tricky_name)
+        assert not _can_connect(host, port, tricky_name, "cg_lockdown_test_role3")
+        # the comma embedded in tricky_name's own literal name must not
+        # be misread as a second, unrelated list entry that happens to
+        # collaterally lock a database sharing that split-off token
+        assert _can_connect(host, port, sibling_name, "cg_lockdown_test_role3")
+    finally:
+        manager.unlock(tricky_name)
+        for name in (tricky_name, sibling_name):
+            admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute("DROP ROLE IF EXISTS cg_lockdown_test_role3")
+
+
 def test_stop_drains_in_flight_requests_before_closing(
     manager: LockdownManager,
     pg_dsn: str,

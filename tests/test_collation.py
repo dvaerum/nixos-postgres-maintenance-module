@@ -292,7 +292,11 @@ def test_process_template0_refresh_failure_is_reported_defensively(
         error = process_template0(c_locale_admin_conn)
 
         assert error is not None
-        assert "invalid collation version change" in error
+        # The real Postgres error ("invalid collation version change")
+        # is logged, not returned -- the return value becomes
+        # Failure.error, which reaches every configured hook's
+        # environment (see _safe_refresh's own docstring/comment).
+        assert error == "REFRESH COLLATION VERSION failed for template0 (see journal for details)"
         # the failed REFRESH must roll back cleanly, not leave the
         # recorded version in a half-updated state
         assert template0_collation_is_stale(c_locale_admin_conn)

@@ -170,9 +170,16 @@ def _safe_refresh(
     try:
         refresh()
     except psycopg.Error as exc:
+        # Full exception text logged here, not returned: the return
+        # value becomes Failure.error, which reaches every configured
+        # hook's environment (including third-party notification
+        # hooks) -- the journal is the one accepted channel for
+        # Postgres's own diagnostic detail (see main.py's
+        # _process_database for the same reasoning applied to its
+        # catch-all).
         logger.error("REFRESH COLLATION VERSION failed for %s: %s", description, exc)
         conn.rollback()
-        return str(exc)
+        return f"REFRESH COLLATION VERSION failed for {description} (see journal for details)"
     else:
         conn.commit()
         return None

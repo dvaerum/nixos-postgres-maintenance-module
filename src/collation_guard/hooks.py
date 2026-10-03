@@ -111,6 +111,7 @@ def run_hook(
     hook: Hook,
     *,
     stage: str,
+    timeout_sec: float,
     database: str | None = None,
     context: dict[str, object] | None = None,
     error: str | None = None,
@@ -120,7 +121,13 @@ def run_hook(
     for the collision rule -- a collision propagates out of this call
     as EnvironmentCollisionError, the hook never runs). The ambient
     process environment (PATH, HOME, PGHOST/PGPORT/etc.) is inherited
-    underneath the merged set, not part of the collision check."""
+    underneath the merged set, not part of the collision check.
+
+    timeout_sec has no default here deliberately -- every caller goes
+    through _run_hooks(), which always has one
+    (services.postgresqlCollationGuard.hooks.timeoutSec, default 90s):
+    a hung hook would otherwise block this oneshot unit indefinitely,
+    gating postgresql.target on it."""
     default_vars: dict[str, str] = {"COLLATION_GUARD_STAGE": stage}
     if database is not None:
         default_vars["COLLATION_GUARD_DATABASE"] = database
@@ -132,12 +139,26 @@ def run_hook(
     file_vars = parse_environment_file(hook.environment_file) if hook.environment_file else {}
     merged = merge_environment(default_vars, file_vars, hook.environment)
 
-    result = subprocess.run(
-        [hook.path, *hook.args],
-        env={**os.environ, **merged},
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [hook.path, *hook.args],
+            env={**os.environ, **merged},
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "hook %s (stage=%s) timed out after %s second(s)", hook.path, stage, timeout_sec
+        )
+        return HookResult(
+            ok=False,
+            block_on_failure=hook.block_on_failure,
+            stdout="",
+            stderr=f"timed out after {timeout_sec} second(s)",
+            returncode=-1,
+        )
+
     ok = result.returncode == 0
     if not ok:
         logger.warning(

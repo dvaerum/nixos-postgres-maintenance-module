@@ -69,6 +69,30 @@ def test_connect_tags_the_connection_with_application_name(pg_dsn: str) -> None:
     assert row == ("collation-guard",)
 
 
+def test_connect_handles_a_database_name_that_would_break_a_raw_conninfo_string(
+    pg_dsn: str, admin_conn: psycopg.Connection
+) -> None:
+    """Security regression: dbname is runtime-discovered catalog data
+    (pg_database.datname), not a trusted literal -- a database legally
+    named with a space and a single quote (e.g. one crafted to inject
+    extra libpq connection parameters via `options='...'`) must connect
+    to exactly that database, not have its name re-tokenized as part of
+    the conninfo string. Before the fix (f-string interpolation into a
+    single conninfo string), this name would either fail to parse or
+    silently alter the connection's own parameters instead of
+    connecting to the named database."""
+    host, port = _host_port(pg_dsn)
+    tricky_name = "cg_connect_test db options='-c foo=bar'"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{tricky_name}"')
+    admin_conn.execute(f'CREATE DATABASE "{tricky_name}"')
+    try:
+        with main._connect(host, port, tricky_name) as conn:
+            row = conn.execute("SELECT current_database()").fetchone()
+        assert row == (tricky_name,)
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{tricky_name}"')
+
+
 def test_run_is_a_clean_success_on_an_unremarkable_cluster(pg_dsn: str) -> None:
     host, port = _host_port(pg_dsn)
 
@@ -1183,6 +1207,41 @@ def test_run_exception_during_per_database_processing_does_not_crash_the_whole_r
     assert "postgres" in report.databases_processed
 
 
+def test_process_database_exception_text_never_reaches_report_failures(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Security regression: an unexpected exception during per-database
+    processing (e.g. a constraint violation from the partition-repair
+    UPDATE) can carry Postgres's own DETAIL text -- real row/column
+    values -- in str(exc). That text must never reach report.failures,
+    since Failure.error is handed to every configured hook's
+    environment, including third-party notification hooks. Only the
+    logger (the journal) is the accepted channel for the full detail."""
+    host, port = _host_port(pg_dsn)
+    sensitive = "alice@example.com"
+
+    def boom(conn: psycopg.Connection, *, already_reindexed: bool = False) -> None:
+        raise RuntimeError(f"duplicate key value violates ... DETAIL: Key (email)=({sensitive})")
+
+    monkeypatch.setattr(collation, "process_database", boom)
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+    )
+
+    assert not report.success
+    for failure in report.failures:
+        assert sensitive not in failure.error
+    assert any(
+        f.error == "processing raised an unexpected exception (see journal for details)"
+        for f in report.failures
+    )
+
+
 def test_apply_collation_result_marks_repaired_and_logs_on_reindexed() -> None:
     """Direct unit test for a pure, dependency-free function -- round
     1 extracted _apply_collation_result specifically to be the one
@@ -1248,6 +1307,50 @@ def test_main_passes_max_parallel_databases_env_var_to_run(
 
     assert main.main() == 0
     assert captured["max_parallel_databases"] == 7
+
+
+def test_main_passes_hook_timeout_sec_env_var_to_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> main.RunReport:
+        captured.update(kwargs)
+        return main.RunReport()
+
+    monkeypatch.setattr(main, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["collation-guard"])
+    monkeypatch.setenv("PGHOST", "x")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("GLIBC_LOCALES_PATH", "/nix/store/x")
+    monkeypatch.setenv("COLLATION_GUARD_PARTITION_REPAIR_ENABLE", "true")
+    monkeypatch.setenv("COLLATION_GUARD_MAX_REPAIR_ATTEMPTS", "100")
+    monkeypatch.setenv("COLLATION_GUARD_HOOK_TIMEOUT_SEC", "45")
+
+    assert main.main() == 0
+    assert captured["hook_timeout_sec"] == 45.0
+
+
+def test_main_hook_timeout_sec_defaults_to_90_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> main.RunReport:
+        captured.update(kwargs)
+        return main.RunReport()
+
+    monkeypatch.setattr(main, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["collation-guard"])
+    monkeypatch.setenv("PGHOST", "x")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("GLIBC_LOCALES_PATH", "/nix/store/x")
+    monkeypatch.setenv("COLLATION_GUARD_PARTITION_REPAIR_ENABLE", "true")
+    monkeypatch.setenv("COLLATION_GUARD_MAX_REPAIR_ATTEMPTS", "100")
+    monkeypatch.delenv("COLLATION_GUARD_HOOK_TIMEOUT_SEC", raising=False)
+
+    assert main.main() == 0
+    assert captured["hook_timeout_sec"] == 90.0
 
 
 def test_run_dedupes_databases_repaired_across_glibc_stamp_and_worker_paths(

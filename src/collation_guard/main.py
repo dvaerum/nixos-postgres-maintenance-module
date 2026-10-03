@@ -71,8 +71,19 @@ def _mark_repaired(report: RunReport, dbname: str) -> None:
 
 
 def _connect(host: str, port: str, dbname: str) -> psycopg.Connection:
+    # dbname is a runtime-discovered, catalog-sourced identifier (see
+    # collation.connectable_databases()), not a trusted literal -- it
+    # must never be spliced into a conninfo *string* (libpq's own
+    # tokenizer would re-interpret a crafted database name, e.g. one
+    # containing `options='...'`, as extra connection parameters for
+    # this superuser connection). Passing it as a keyword argument
+    # instead routes it through psycopg's make_conninfo()/_param_escape(),
+    # which quotes/escapes it correctly.
     return psycopg.connect(
-        f"host={host} port={port} dbname={dbname} application_name=collation-guard",
+        host=host,
+        port=port,
+        dbname=dbname,
+        application_name="collation-guard",
         prepare_threshold=None,
     )
 
@@ -172,6 +183,7 @@ def _process_database(
     max_attempts: int,
     hooks: HooksConfig,
     manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
+    hook_timeout_sec: float,
     glibc_reindexed: bool = False,
 ) -> RunReport:
     """Processes one database in complete isolation, returning its own
@@ -189,7 +201,12 @@ def _process_database(
     report = RunReport()
 
     if not _run_hooks(
-        hooks.per_database.pre_start, "database_pre_start", report, database=dbname, context={}
+        hooks.per_database.pre_start,
+        "database_pre_start",
+        report,
+        timeout_sec=hook_timeout_sec,
+        database=dbname,
+        context={},
     ):
         # blockOnFailure=true: skip this database entirely -- no
         # process_database, no partition repair, not added to
@@ -229,9 +246,22 @@ def _process_database(
         report.databases_processed.append(dbname)
         ok = collation_ok and partition_ok
     except Exception as exc:
+        # Full exception text (which, for a constraint-violation error
+        # from the repair UPDATE, includes Postgres's own DETAIL line --
+        # real row/column values) is logged here, not put in
+        # Failure.error: the latter reaches every configured hook's
+        # environment, including third-party notification hooks, where
+        # that data was never meant to go. The journal is this
+        # project's one accepted channel for this detail (same
+        # reasoning already applied to the REINDEX-failure path, which
+        # only ever reports a fixed "REINDEX failed" to hooks).
         logger.warning("%s: processing raised: %s", dbname, exc, exc_info=True)
         report.failures.append(
-            Failure(database=dbname, relation=dbname, error=f"processing raised: {exc}")
+            Failure(
+                database=dbname,
+                relation=dbname,
+                error="processing raised an unexpected exception (see journal for details)",
+            )
         )
         ok = False
 
@@ -240,6 +270,7 @@ def _process_database(
             hooks.per_database.on_success,
             "database_success",
             report,
+            timeout_sec=hook_timeout_sec,
             database=dbname,
             context={"reindexed": reindexed},
         )
@@ -249,6 +280,7 @@ def _process_database(
             hooks.per_database.on_failure,
             "database_failure",
             report,
+            timeout_sec=hook_timeout_sec,
             database=dbname,
             error=error,
             context={
@@ -341,6 +373,7 @@ def _run_hooks(
     stage: str,
     report: RunReport,
     *,
+    timeout_sec: float,
     database: str | None = None,
     context: dict[str, object] | None = None,
     error: str | None = None,
@@ -364,7 +397,14 @@ def _run_hooks(
     ok = True
     for hook in hooks:
         try:
-            result = run_hook(hook, stage=stage, database=database, context=context, error=error)
+            result = run_hook(
+                hook,
+                stage=stage,
+                timeout_sec=timeout_sec,
+                database=database,
+                context=context,
+                error=error,
+            )
         except Exception as exc:
             logger.warning(
                 "%s hook %s raised for %s: %s",
@@ -413,6 +453,7 @@ def run(
     dry_run: bool = False,
     lockdown_path: str | None = None,
     connection_lockdown_enabled: bool = True,
+    hook_timeout_sec: float = 90,
 ) -> RunReport:
     report = RunReport()
     hooks = hooks or HooksConfig()
@@ -439,7 +480,11 @@ def run(
 
     try:
         if not _run_hooks(
-            hooks.pre_start, "pre_start", report, context=_report_context(report)
+            hooks.pre_start,
+            "pre_start",
+            report,
+            timeout_sec=hook_timeout_sec,
+            context=_report_context(report),
         ):
             return report
 
@@ -470,6 +515,7 @@ def run(
                     max_repair_attempts,
                     hooks,
                     manager,
+                    hook_timeout_sec,
                     dbname in glibc_reindexed,
                 )
                 for dbname in sorted(databases)
@@ -485,7 +531,13 @@ def run(
         report.databases_repaired.sort()
 
         if report.success:
-            _run_hooks(hooks.on_success, "on_success", report, context=_report_context(report))
+            _run_hooks(
+                hooks.on_success,
+                "on_success",
+                report,
+                timeout_sec=hook_timeout_sec,
+                context=_report_context(report),
+            )
 
         # postRun fires regardless of outcome -- unlike onSuccess, which is
         # deliberately gated on a clean run.
@@ -494,6 +546,7 @@ def run(
             hooks.post_run,
             "post_run",
             report,
+            timeout_sec=hook_timeout_sec,
             context=_report_context(report),
             error=post_run_error,
         )
@@ -531,6 +584,7 @@ def run_on_failure(
     lockdown_path: str | None = None,
     host: str | None = None,
     port: str | None = None,
+    hook_timeout_sec: float = 90,
 ) -> int:
     """Second entry point, invoked by the postgresql-collation-guard-
     on-failure.service companion unit after the main run failed or
@@ -577,7 +631,14 @@ def run_on_failure(
 
     context, error = _recover_last_context(context_file)
     report = RunReport()
-    _run_hooks(hooks.on_failure, "on_failure", report, context=context, error=error)
+    _run_hooks(
+        hooks.on_failure,
+        "on_failure",
+        report,
+        timeout_sec=hook_timeout_sec,
+        context=context,
+        error=error,
+    )
     return 0 if report.success else 1
 
 
@@ -613,6 +674,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    hook_timeout_sec = float(os.environ.get("COLLATION_GUARD_HOOK_TIMEOUT_SEC", "90"))
+
     if args.on_failure:
         return run_on_failure(
             os.environ["COLLATION_GUARD_HOOKS_FILE"],
@@ -620,6 +683,7 @@ def main() -> int:
             lockdown_path=os.environ.get("COLLATION_GUARD_LOCKDOWN_FILE"),
             host=os.environ.get("PGHOST"),
             port=os.environ.get("PGPORT"),
+            hook_timeout_sec=hook_timeout_sec,
         )
 
     hooks_file = os.environ.get("COLLATION_GUARD_HOOKS_FILE")
@@ -638,6 +702,7 @@ def main() -> int:
         connection_lockdown_enabled=(
             os.environ.get("COLLATION_GUARD_CONNECTION_LOCKDOWN_ENABLE", "true") == "true"
         ),
+        hook_timeout_sec=hook_timeout_sec,
     )
 
     if args.dry_run:

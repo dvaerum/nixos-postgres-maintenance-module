@@ -107,7 +107,7 @@ def test_run_hook_happy_path_passes_argv_and_merged_env(tmp_path):
         environment={"FROM_ENVIRONMENT": "inline"},
     )
 
-    result = run_hook(hook, stage="pre_start")
+    result = run_hook(hook, stage="pre_start", timeout_sec=5)
 
     assert result.ok
     recorded = json.loads(out.read_text())
@@ -124,7 +124,7 @@ def test_run_hook_merges_environment_file_too(tmp_path):
     env_file.write_text("FROM_FILE=shh\n")
     hook = Hook(path=sys.executable, args=[str(script), str(out)], environment_file=str(env_file))
 
-    run_hook(hook, stage="pre_start")
+    run_hook(hook, stage="pre_start", timeout_sec=5)
 
     recorded = json.loads(out.read_text())
     assert recorded["env"]["FROM_FILE"] == "shh"
@@ -142,7 +142,7 @@ def test_run_hook_collision_between_environment_and_environment_file_raises(tmp_
     )
 
     with pytest.raises(EnvironmentCollisionError):
-        run_hook(hook, stage="pre_start")
+        run_hook(hook, stage="pre_start", timeout_sec=5)
 
 
 def test_run_hook_failure_path_does_not_raise(tmp_path):
@@ -153,11 +153,26 @@ def test_run_hook_failure_path_does_not_raise(tmp_path):
     failing_script.write_text("import sys; sys.stderr.write('boom'); sys.exit(1)\n")
     hook = Hook(path=sys.executable, args=[str(failing_script)], block_on_failure=True)
 
-    result = run_hook(hook, stage="pre_start")
+    result = run_hook(hook, stage="pre_start", timeout_sec=5)
 
     assert not result.ok
     assert result.returncode == 1
     assert "boom" in result.stderr
+    assert result.block_on_failure is True
+
+
+def test_run_hook_timeout_is_reported_as_failure_not_hung_forever(tmp_path):
+    """Security/availability regression: a hook has no inherent bound
+    on how long it can run, and this oneshot unit's own hook-running
+    loop blocks on it synchronously -- gating postgresql.target. A
+    hung hook must fail fast at timeout_sec, not hang the whole run."""
+    hanging_script = tmp_path / "hang.py"
+    hanging_script.write_text("import time; time.sleep(60)\n")
+    hook = Hook(path=sys.executable, args=[str(hanging_script)], block_on_failure=True)
+
+    result = run_hook(hook, stage="pre_start", timeout_sec=0.2)
+
+    assert not result.ok
     assert result.block_on_failure is True
 
 
@@ -226,7 +241,7 @@ def test_run_hook_sets_exactly_the_reserved_vars_for_each_stage(
     )
     hook = Hook(path=sys.executable, args=[str(script), str(out)])
 
-    run_hook(hook, stage=stage, database=database, context=context, error=error)
+    run_hook(hook, stage=stage, timeout_sec=5, database=database, context=context, error=error)
 
     assert set(json.loads(out.read_text())) == expected_vars
 

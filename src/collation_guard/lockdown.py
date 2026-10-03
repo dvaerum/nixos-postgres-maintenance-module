@@ -25,6 +25,25 @@ import psycopg
 _RELOAD_CONFIRM_TIMEOUT = 2.0
 
 
+def _hba_quote(name: str) -> str:
+    """Quotes one database name for pg_hba.conf's comma-separated
+    database field. A database name is runtime-discovered catalog
+    data (pg_database.datname), not a trusted literal, and pg_hba.conf
+    treats a bare comma or whitespace as a field separator -- written
+    unquoted, a name containing one would either silently evade its
+    own lockdown (never matched by any token in the list) or break the
+    line's parsing for every other database sharing this file.
+    Double-quoting matches Postgres's own hba.c tokenizer (next_token()):
+    inside a quoted field, comma/whitespace are literal, and "" is an
+    escaped literal quote -- the same rule as pg_ident.conf.
+    A bare newline has no representation this single-line writer can
+    produce correctly, so it's rejected outright rather than silently
+    mis-quoted into a line that could fail open."""
+    if "\n" in name:
+        raise ValueError(f"database name contains a newline, cannot be locked safely: {name!r}")
+    return '"' + name.replace('"', '""') + '"'
+
+
 @dataclass(frozen=True, slots=True)
 class _LockRequest:
     dbname: str
@@ -52,7 +71,10 @@ class LockdownManager:
         # sweep below can tell it apart from a connection this manager
         # should actually terminate.
         self._conn = psycopg.connect(
-            f"host={host} port={port} dbname=postgres application_name=collation-guard",
+            host=host,
+            port=port,
+            dbname="postgres",
+            application_name="collation-guard",
             autocommit=True,
             prepare_threshold=None,
         )
@@ -145,7 +167,7 @@ class LockdownManager:
             except FileNotFoundError:
                 pass
             return
-        dblist = ",".join(sorted(self._locked))
+        dblist = ",".join(_hba_quote(name) for name in sorted(self._locked))
         with open(self._lockdown_path, "w") as f:
             f.write(f"local   {dblist}   all                reject\n")
             f.write(f"host    {dblist}   all   0.0.0.0/0    reject\n")
@@ -192,7 +214,10 @@ def cleanup_lockdown_file(host: str, port: str, lockdown_path: str) -> None:
     except FileNotFoundError:
         return
     with psycopg.connect(
-        f"host={host} port={port} dbname=postgres application_name=collation-guard",
+        host=host,
+        port=port,
+        dbname="postgres",
+        application_name="collation-guard",
         autocommit=True,
         prepare_threshold=None,
     ) as conn:
