@@ -1520,12 +1520,15 @@ true
 
 Safety cap on the repair loop for one partitioned table, where
 each attempt is a full pass over every leaf partition, repeated
-until a pass moves nothing\. Capped rather than single-pass
-because moving a misplaced row into a different partition can
-require that partition’s own next pass to re-check it, and
-there’s no proof this always converges in one sweep (see
-docs/learnings/partition-repair-testing\.md)\. Hitting the cap
-fails loudly instead of spinning forever\.
+until a pass moves nothing\. Two passes provably suffice given
+` connectionLockdown ` excludes every other writer during repair
+(the default) – see
+docs/learnings/partition-repair-convergence\.md for the full
+reasoning\. The default of 3 is that proven bound plus one
+pass of margin: hitting the cap is a signal something
+unexpected is happening, not evidence the table just needed
+more time, so it fails loudly rather than retrying up to some
+much larger number\.
 
 
 
@@ -1537,7 +1540,7 @@ positive integer, meaning >0
 *Default:*
 
 ```nix
-1000
+3
 ```
 
 *Declared by:*

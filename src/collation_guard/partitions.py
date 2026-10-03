@@ -107,22 +107,23 @@ def repair_partition_table(
     schema: str,
     table: str,
     key_columns: list[str],
-    max_attempts: int = 100,
+    max_attempts: int = 3,
 ) -> PartitionRepairResult:
     """Repair every misplaced row across every leaf partition under
     `table` (descending through any sub-partitioned levels; see
-    partition_leaves()), looping until a full pass finds nothing left
-    to fix or a safety cap is hit. A capped loop rather than one pass:
-    repairing a row moves it to a *different* partition, which that
-    partition's own next scan will need to re-examine, and the project
-    has no prior art to trust that this always converges in one pass
-    (see docs/learnings/partition-repair-testing.md). A ruled leaf is
-    skipped entirely (see has_rule()) and excluded from every pass, not
-    just logged once. repair_row() is always called with `table` as the
-    routing root, regardless of a leaf's actual depth -- cross-partition
-    UPDATE routing descends through the whole tree from wherever it's
-    targeted, so there's no need to route through an intermediate
-    sub-parent.
+    partition_leaves()), looping until a full pass moves nothing or a
+    safety cap is hit. A capped loop rather than one pass: a row moved
+    into a leaf whose own turn already passed this pass isn't confirmed
+    correct until the next sweep -- a leaf-visit-order bookkeeping
+    artifact, not a row genuinely needing to move more than once (see
+    docs/learnings/partition-repair-convergence.md for why, given
+    connection lockdown excluding every other writer, two passes always
+    suffice). A ruled leaf is skipped entirely (see has_rule()) and
+    excluded from every pass, not just logged once. repair_row() is
+    always called with `table` as the routing root, regardless of a
+    leaf's actual depth -- cross-partition UPDATE routing descends
+    through the whole tree from wherever it's targeted, so there's no
+    need to route through an intermediate sub-parent.
     """
     all_leaves = partition_leaves(conn, schema, table)
     leaves = [c for c in all_leaves if not has_rule(conn, schema, c)]

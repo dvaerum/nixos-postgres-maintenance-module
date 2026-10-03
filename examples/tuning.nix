@@ -14,9 +14,14 @@
 
     partitionRepair = {
       enable = true;
-      # The default (1000) is a safety cap, not a target -- raise it
-      # only once a specific partitioned table is known to have more
-      # misplaced rows than that after a real collation change.
+      # The default (3) is a proven bound (two passes always suffice
+      # given connectionLockdown excludes every other writer -- see
+      # docs/learnings/partition-repair-convergence.md) plus one pass
+      # of margin, not a target to raise for a bigger table -- the
+      # pass count doesn't scale with how many rows are misplaced.
+      # Raise it only alongside connectionLockdown.enable = false,
+      # where a concurrent writer really can introduce new drift
+      # mid-repair and the two-pass proof no longer applies.
       maxRepairAttempts = 5000;
     };
   };
