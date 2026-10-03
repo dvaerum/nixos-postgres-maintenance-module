@@ -19,7 +19,7 @@
               {
                 printf 'ERROR=%s\n' "$COLLATION_GUARD_ERROR"
                 printf 'CONTEXT=%s\n' "$COLLATION_GUARD_CONTEXT"
-              } > /tmp/collation-guard-whole-run-onfailure-marker
+              } > /run/postgresql-collation-guard/whole-run-onfailure-marker
             '';
           }
         );

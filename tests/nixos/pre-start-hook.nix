@@ -37,7 +37,7 @@ in
     ).strip()
     assert guard_state == "failed", f"expected the guard unit to be 'failed', got {guard_state!r}"
 
-    marker = machine.succeed("cat /tmp/collation-guard-prestart-marker")
+    marker = machine.succeed("cat /run/postgresql-collation-guard/prestart-marker")
     assert "STAGE=pre_start" in marker, marker
 
     context = machine.succeed("cat /run/postgresql-collation-guard/last-run.json")

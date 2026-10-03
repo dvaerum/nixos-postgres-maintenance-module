@@ -14,7 +14,7 @@
           pkgs.writeShellApplication {
             name = "collation-guard-prestart-marker";
             text = ''
-              printf 'STAGE=%s\n' "$COLLATION_GUARD_STAGE" > /tmp/collation-guard-prestart-marker
+              printf 'STAGE=%s\n' "$COLLATION_GUARD_STAGE" > /run/postgresql-collation-guard/prestart-marker
               exit 1
             '';
           }

@@ -1276,6 +1276,39 @@ absolute path
 
 
 
+## services\.postgresqlCollationGuard\.hooks\.timeoutSec
+
+
+
+Per-hook timeout, applied to every one of the seven hook
+points uniformly\. A hook has no inherent bound on how long
+it can run, and every hook-running call in this project
+blocks synchronously on it – a hung hook (a stuck webhook
+script, a misconfigured notifier) would otherwise stall this
+oneshot unit, and hence ` postgresql.target `, indefinitely\.
+Defaults to systemd’s own ` DefaultTimeoutStartSec ` (90s) –
+the bound a hung hook was already implicitly subject to via
+the unit’s own start timeout, now enforced per-hook instead
+and explicit rather than relying on that systemd default\.
+
+
+
+*Type:*
+positive integer, meaning >0
+
+
+
+*Default:*
+
+```nix
+90
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
 ## services\.postgresqlCollationGuard\.maxParallelDatabases
 
 
@@ -1297,6 +1330,65 @@ positive integer, meaning >0
 
 ```nix
 4
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.onFailureService\.group
+
+
+
+OS group the ` postgresql-collation-guard-on-failure ` companion
+unit runs as\. See ` user ` above for why it defaults to match
+the main unit\.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+
+```nix
+"postgres"
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.onFailureService\.user
+
+
+
+OS user the ` postgresql-collation-guard-on-failure ` companion
+unit (triggered via the main unit’s ` OnFailure= `) runs as\.
+Defaults to match ` services.postgresql.superUser ` (also
+“postgres” unless overridden) – the same Postgres superuser
+the main unit itself runs as, since this unit’s job is
+identical in kind (running the exact same hook mechanism,
+plus the crash-recovery lockdown-file cleanup, which connects
+to Postgres as this user) – override only for a deployment-
+specific reason, e\.g\. a hardened setup that runs ` onFailure `
+hooks under a dedicated, more restricted account\.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+
+```nix
+"postgres"
 ```
 
 *Declared by:*

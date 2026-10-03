@@ -57,6 +57,14 @@ let
 in
 {
   config = lib.mkIf cfg.enable {
+    # Static "postgres" is options.nix's own standalone default (safe
+    # for doc generation, which evaluates options.nix with no real
+    # services.postgresql present) -- this tracks the actually
+    # configured superuser once a real NixOS config is evaluated,
+    # while still losing to an explicit user override (mkDefault's
+    # lower precedence).
+    services.postgresqlCollationGuard.onFailureService.user = lib.mkDefault pgCfg.superUser;
+
     systemd.tmpfiles.rules = [
       # /run is tmpfs; systemd-tmpfiles-setup.service (which applies this)
       # runs at early boot, well before postgresql-collation-guard.service
@@ -95,6 +103,7 @@ in
         COLLATION_GUARD_HOOKS_FILE = "${hooksFile}";
         COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
         COLLATION_GUARD_CONNECTION_LOCKDOWN_ENABLE = lib.boolToString cfg.connectionLockdown.enable;
+        COLLATION_GUARD_HOOK_TIMEOUT_SEC = toString cfg.hooks.timeoutSec;
       };
 
       serviceConfig = {
@@ -102,6 +111,19 @@ in
         RemainAfterExit = true;
         User = pgCfg.superUser;
         Group = "postgres";
+        # Cheap, zero-functional-cost hardening: nothing this unit does
+        # needs to gain privileges via exec (NoNewPrivileges) or share
+        # /tmp with other services (PrivateTmp). Broader directives
+        # (ProtectSystem, RestrictAddressFamilies) are deliberately NOT
+        # set here -- this unit needs real write access to the Postgres
+        # data directory, and hooks are user-configured executables
+        # that legitimately include network-calling notification hooks
+        # (see docs/decisions/0006) -- either would need case-by-case
+        # tuning (e.g. ReadWritePaths) to avoid breaking by default,
+        # not a blanket default. Override via `lib.mkForce` if either
+        # of these two ever conflicts with a specific deployment.
+        NoNewPrivileges = true;
+        PrivateTmp = true;
         # preStart/onSuccess/postRun are invoked by the guard itself
         # now, not via ExecStartPre/ExecStartPost/ExecStopPost -- see
         # docs/decisions/0006 for why unifying them under one
@@ -134,9 +156,20 @@ in
         COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
         PGHOST = "/run/postgresql";
         PGPORT = toString pgCfg.settings.port;
+        COLLATION_GUARD_HOOK_TIMEOUT_SEC = toString cfg.hooks.timeoutSec;
       };
       serviceConfig = {
         Type = "oneshot";
+        # Defaults to the same user/group as the main unit (see
+        # services.postgresqlCollationGuard.onFailureService's own
+        # description) -- this unit runs the identical hook mechanism,
+        # plus a lockdown-file cleanup that connects to Postgres as
+        # this user, so it must match rather than fall back to
+        # systemd's own root default.
+        User = cfg.onFailureService.user;
+        Group = cfg.onFailureService.group;
+        NoNewPrivileges = true;
+        PrivateTmp = true;
         ExecStart = "${lib.getExe cfg.package} --on-failure";
       };
     };

@@ -54,9 +54,9 @@ in
     # separate process -- wait for its marker rather than the unit's
     # own (non-RemainAfterExit) active state, which clears the instant
     # its oneshot ExecStart finishes.
-    machine.wait_for_file("/tmp/collation-guard-whole-run-onfailure-marker")
+    machine.wait_for_file("/run/postgresql-collation-guard/whole-run-onfailure-marker")
 
-    marker = machine.succeed("cat /tmp/collation-guard-whole-run-onfailure-marker")
+    marker = machine.succeed("cat /run/postgresql-collation-guard/whole-run-onfailure-marker")
     assert "ERROR=postgres.widgets: REINDEX failed" in marker, marker
     assert '"success": false' in marker, marker
     assert '"widgets"' in marker, marker

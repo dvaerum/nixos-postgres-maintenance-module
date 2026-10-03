@@ -71,7 +71,7 @@ in
     ).strip()
     assert guard_state == "failed", f"expected the guard unit to be 'failed', got {guard_state!r}"
 
-    marker = machine.succeed("cat /tmp/collation-guard-onfailure-marker")
+    marker = machine.succeed("cat /run/postgresql-collation-guard/onfailure-marker")
     assert "DATABASE=postgres" in marker, marker
     assert "ERROR=widgets: REINDEX failed" in marker, marker
     assert "CONTEXT=" in marker and '"failures"' in marker and '"widgets"' in marker, marker
