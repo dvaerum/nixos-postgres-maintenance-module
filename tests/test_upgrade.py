@@ -542,3 +542,216 @@ def test_old_datadir_due_for_cleanup_once_the_window_elapses() -> None:
     completed_at = datetime(2026, 1, 1, tzinfo=UTC)
     ten_days_later = completed_at + timedelta(days=10)
     assert upgrade.old_datadir_due_for_cleanup(completed_at, 10, now=ten_days_later) is True
+
+
+# -- run_upgrade(): the top-level entry point the
+# postgresql-collation-guard-upgrade.service unit calls (docs/decisions/0011).
+# Real tmp_path filesystem state drives the (cheap) gating logic
+# (read_pg_version/validate_old_version); only the actually-external pieces
+# (resolve_transfer_mode's own preflight, initdb_new_cluster, run_pg_upgrade,
+# record_upgrade_completion) are mocked.
+
+
+def _make_cluster(path: Path, schema: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "PG_VERSION").write_text(f"{schema}\n")
+
+
+def test_run_upgrade_is_a_noop_when_new_datadir_already_upgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idempotent by construction (docs/decisions/0011): upgrade.enable
+    can stay true across any number of subsequent boots with no repeat
+    effect, since the only gate is whether new_datadir already has its
+    own PG_VERSION."""
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+    _make_cluster(new_datadir, "16")
+
+    called: list[str] = []
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: called.append("initdb"))
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda *a, **k: called.append("pg_upgrade"))
+
+    result = upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+    )
+    assert result is False
+    assert called == []
+
+
+def test_run_upgrade_is_a_noop_when_there_is_no_old_cluster_yet(tmp_path: Path) -> None:
+    """A brand-new host with upgrade.enable turned on ahead of the very
+    first boot -- nothing to upgrade *from*, not an error. The upstream
+    postgresql.service preStart initdb's new_datadir itself, same as if
+    upgrade.enable were false."""
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    result = upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+    )
+    assert result is False
+
+
+def test_run_upgrade_raises_on_old_version_mismatch(tmp_path: Path) -> None:
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "14")  # disagrees with the configured old_schema below
+    with pytest.raises(upgrade.VersionMismatchError):
+        upgrade.run_upgrade(
+            old_bindir="/old/bin",
+            new_bindir="/new/bin",
+            old_datadir=str(old_datadir),
+            new_datadir=str(new_datadir),
+            old_schema="15",
+            new_schema="16",
+            superuser="postgres",
+            completion_state_file=str(tmp_path / "completed.json"),
+        )
+
+
+def test_run_upgrade_is_a_noop_when_old_and_new_schema_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "16")
+
+    called: list[str] = []
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: called.append("initdb"))
+
+    result = upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="16",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+    )
+    assert result is False
+    assert called == []
+
+
+def test_run_upgrade_happy_path_calls_everything_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+
+    call_order: list[str] = []
+
+    def fake_resolve(
+        requested: str, *, old_datadir: str, new_datadir_parent: str
+    ) -> str:
+        call_order.append("resolve")
+        return "clone"
+
+    monkeypatch.setattr(upgrade, "resolve_transfer_mode", fake_resolve)
+    monkeypatch.setattr(
+        upgrade, "initdb_new_cluster", lambda *a, **k: call_order.append("initdb")
+    )
+    monkeypatch.setattr(
+        upgrade, "run_pg_upgrade", lambda *a, **k: call_order.append("pg_upgrade")
+    )
+    monkeypatch.setattr(
+        upgrade, "record_upgrade_completion", lambda *a, **k: call_order.append("record")
+    )
+
+    result = upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+    )
+    assert result is True
+    assert call_order == ["resolve", "initdb", "pg_upgrade", "record"]
+
+
+def test_run_upgrade_passes_resolved_mode_jobs_and_initdb_args_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+
+    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "link")
+    monkeypatch.setattr(upgrade, "record_upgrade_completion", lambda *a, **k: None)
+
+    initdb_recorded: dict[str, object] = {}
+    pg_upgrade_recorded: dict[str, object] = {}
+    monkeypatch.setattr(
+        upgrade, "initdb_new_cluster", lambda *a, **k: initdb_recorded.update(kwargs=k, args=a)
+    )
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: pg_upgrade_recorded.update(k))
+
+    upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+        transfer_mode="link",
+        jobs=4,
+        initdb_args=["--data-checksums"],
+    )
+    assert pg_upgrade_recorded["transfer_mode"] == "link"
+    assert pg_upgrade_recorded["jobs"] == 4
+    assert initdb_recorded["kwargs"]["initdb_args"] == ["--data-checksums"]
+
+
+def test_run_upgrade_records_completion_against_the_old_datadir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+
+    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
+
+    recorded: dict[str, object] = {}
+    monkeypatch.setattr(
+        upgrade,
+        "record_upgrade_completion",
+        lambda state_file, old_dir, **k: recorded.update(
+            state_file=state_file, old_datadir=old_dir
+        ),
+    )
+
+    completion_state_file = str(tmp_path / "completed.json")
+    upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=completion_state_file,
+    )
+    assert recorded == {"state_file": completion_state_file, "old_datadir": str(old_datadir)}

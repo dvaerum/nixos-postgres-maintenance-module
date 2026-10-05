@@ -375,3 +375,72 @@ def old_datadir_due_for_cleanup(
     moment = now if now is not None else datetime.now(UTC)
     return moment >= completed_at + timedelta(days=retention_days)
 
+
+def run_upgrade(
+    *,
+    old_bindir: str,
+    new_bindir: str,
+    old_datadir: str,
+    new_datadir: str,
+    old_schema: str,
+    new_schema: str,
+    superuser: str,
+    transfer_mode: str = "auto",
+    jobs: int | None = None,
+    initdb_args: list[str] | None = None,
+    completion_state_file: str,
+) -> bool:
+    """Top-level entry point for the postgresql-collation-guard-upgrade
+    unit (ordered Before=["postgresql.service"] -- see
+    docs/decisions/0011), tying every piece above together. Returns
+    True iff an upgrade actually ran (and succeeded); False for every
+    no-op case below.
+
+    Idempotent by construction, the ONE gate: new_datadir already
+    having its own PG_VERSION means an upgrade already ran here --
+    upgrade.enable can stay true indefinitely across any number of
+    subsequent boots with no repeat effect (docs/decisions/0011), no
+    separate "already ran" marker needed.
+
+    A missing old_datadir (no PG_VERSION at all) is a second, distinct
+    no-op: a brand-new host with upgrade.enable configured ahead of its
+    very first boot has nothing to upgrade *from* -- the upstream
+    postgresql.service preStart initdb's new_datadir itself in that
+    case, exactly as if upgrade.enable were false.
+
+    validate_old_version() still runs before the upgrade_needed() check
+    below, even though neither raises anything irreversible on its own
+    -- an old cluster that's secretly the wrong version must be caught
+    immediately, before anything downstream (even the no-op path) ever
+    assumes old_schema is trustworthy.
+    """
+    if read_pg_version(new_datadir) is not None:
+        return False
+
+    if read_pg_version(old_datadir) is None:
+        return False
+
+    validate_old_version(old_datadir, old_schema)
+
+    if not upgrade_needed(old_schema, new_schema):
+        return False
+
+    resolved_mode = resolve_transfer_mode(
+        transfer_mode,
+        old_datadir=old_datadir,
+        new_datadir_parent=os.path.dirname(new_datadir),
+    )
+
+    initdb_new_cluster(new_bindir, new_datadir, superuser, initdb_args=initdb_args)
+    run_pg_upgrade(
+        old_bindir=old_bindir,
+        new_bindir=new_bindir,
+        old_datadir=old_datadir,
+        new_datadir=new_datadir,
+        transfer_mode=resolved_mode,
+        superuser=superuser,
+        jobs=jobs,
+    )
+    record_upgrade_completion(completion_state_file, old_datadir)
+    return True
+
