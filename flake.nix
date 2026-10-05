@@ -86,6 +86,18 @@
             collationGuardPackage = collation-guard;
           }
         );
+
+        # A real PostgreSQL major-version migration across two genuinely
+        # different binaries (docs/decisions/0010, 0011) -- both ordinary,
+        # already-cached nixpkgs postgresql_NN derivations, unlike
+        # icuDriftTest's custom ICU override rebuild above.
+        pgUpgradeTest = pkgs.testers.nixosTest (
+          import ./tests/nixos/pg-upgrade.nix {
+            postgresqlOld = pkgs.postgresql_16;
+            postgresqlNew = pkgs.postgresql_17;
+            nixosModule = self;
+          }
+        );
       in
       {
         packages.default = collation-guard;
@@ -95,6 +107,11 @@
         # `nix flake check`/CI and is run by hand instead:
         #   nix build .#icuDriftTest -L
         packages.icuDriftTest = icuDriftTest;
+
+        # Same reasoning as icuDriftTest above (a real multi-minute
+        # two-cluster migration, not a logic-level check) -- run by hand:
+        #   nix build .#pgUpgradeTest -L
+        packages.pgUpgradeTest = pgUpgradeTest;
 
         checks = {
           unitTests = collation-guard;
