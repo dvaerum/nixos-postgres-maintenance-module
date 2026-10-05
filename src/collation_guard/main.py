@@ -22,6 +22,17 @@ from .hooks import Hook, HooksConfig, load_hooks, run_hook
 
 logger = logging.getLogger("collation_guard")
 
+# Whichever connectionLockdown mechanism is in play (or none at all) --
+# selected once in run() based on COLLATION_GUARD_LOCKDOWN_MECHANISM
+# (set by the Nix module from the configured PostgreSQL version; see
+# docs/decisions/0009), then threaded through unchanged everywhere a
+# manager is passed around.
+LockdownManagerLike = (
+    lockdown.LockdownManager
+    | lockdown.ConnectionLimitLockdownManager
+    | lockdown.NullLockdownManager
+)
+
 
 @dataclass
 class Failure:
@@ -93,7 +104,7 @@ def _locked_connection(
     host: str,
     port: str,
     dbname: str,
-    manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
+    manager: LockdownManagerLike,
     needs_lock: Callable[[psycopg.Connection], bool],
 ) -> Iterator[psycopg.Connection]:
     with _connect(host, port, dbname) as conn:
@@ -182,7 +193,7 @@ def _process_database(
     partition_repair_enabled: bool,
     max_attempts: int,
     hooks: HooksConfig,
-    manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
+    manager: LockdownManagerLike,
     hook_timeout_sec: float,
     glibc_reindexed: bool = False,
 ) -> RunReport:
@@ -296,7 +307,7 @@ def _process_glibc_stamp(
     port: str,
     glibc_locales_path: str,
     report: RunReport,
-    manager: lockdown.LockdownManager | lockdown.NullLockdownManager,
+    manager: LockdownManagerLike,
 ) -> set[str]:
     """Runs once, sequentially, before run()'s ThreadPoolExecutor
     starts -- mutates the shared `report` directly (same as run()'s
@@ -441,6 +452,56 @@ def _run_hooks(
     return ok
 
 
+def _cleanup_stale_lockdown_state(
+    host: str,
+    port: str,
+    *,
+    lockdown_path: str | None,
+    connection_limit_state_path: str | None,
+) -> None:
+    """Unconditional, run-at-the-top-of-every-real-run self-heal for
+    whatever a *previous* process left behind -- not just the
+    OnFailure= companion unit's own cleanup (run_on_failure()). Needed
+    because that companion unit only fires on a failure systemd itself
+    observes (non-zero exit, crash, kill, timeout); a genuine
+    machine-level crash (power loss, kernel panic) skips it entirely,
+    and the very next thing to run afterward, on the next boot, is
+    this guard itself (`before = ["postgresql-setup.service"]`) -- the
+    one place guaranteed to run before anything else touches Postgres.
+
+    This matters asymmetrically for the two mechanisms (docs/decisions
+    0007 and 0009): the pg_hba.conf lockdown file lives on tmpfs
+    (/run) and already self-heals for free on a reboot (no file ->
+    include_if_exists silently no-ops, and there's no other persisted
+    state to restore) -- cleaning it up here too is just defense in
+    depth. The connection_limit state file's *dangerous* state
+    (pg_database.datconnlimit) is real, durable Postgres catalog data
+    that survives a reboot -- so its state file must ALSO survive one
+    (see nixosModule/config.nix, which deliberately places it under
+    /var/lib, not /run) for this function to ever have anything to
+    restore after a hard crash. Each cleanup is independently
+    defensive (a failure here must never block the real run below,
+    same reasoning as run_on_failure's own docstring) and already a
+    no-op when its own path is None or its own file doesn't exist."""
+    if lockdown_path is not None:
+        try:
+            lockdown.cleanup_lockdown_file(host, port, lockdown_path)
+        except Exception as exc:
+            logger.warning(
+                "stale pg_hba lockdown cleanup at startup raised: %s", exc, exc_info=True
+            )
+
+    if connection_limit_state_path is not None:
+        try:
+            lockdown.cleanup_connection_limit_lockdown(host, port, connection_limit_state_path)
+        except Exception as exc:
+            logger.warning(
+                "stale connection-limit lockdown cleanup at startup raised: %s",
+                exc,
+                exc_info=True,
+            )
+
+
 def run(
     host: str,
     port: str,
@@ -453,6 +514,8 @@ def run(
     dry_run: bool = False,
     lockdown_path: str | None = None,
     connection_lockdown_enabled: bool = True,
+    lockdown_mechanism: str = "pg_hba",
+    connection_limit_state_path: str | None = None,
     hook_timeout_sec: float = 90,
 ) -> RunReport:
     report = RunReport()
@@ -472,11 +535,32 @@ def run(
                     print(f"{dbname}.{schema}.{table}")
         return report
 
-    manager: lockdown.LockdownManager | lockdown.NullLockdownManager = (
-        lockdown.LockdownManager(host, port, lockdown_path)
-        if lockdown_path is not None and connection_lockdown_enabled
-        else lockdown.NullLockdownManager()
+    # Must run before anything below ever considers locking a database
+    # again this run -- see _cleanup_stale_lockdown_state's own
+    # docstring for why this can't just rely on the OnFailure=
+    # companion unit.
+    _cleanup_stale_lockdown_state(
+        host,
+        port,
+        lockdown_path=lockdown_path,
+        connection_limit_state_path=connection_limit_state_path,
     )
+
+    # lockdown_mechanism picks which of the two real managers to build
+    # when connectionLockdown is enabled -- "pg_hba" (PostgreSQL 16+,
+    # docs/decisions/0007) or "connection_limit" (the PostgreSQL < 16
+    # fallback, docs/decisions/0009). Falls back to NullLockdownManager
+    # if the mechanism's own required path wasn't actually supplied --
+    # same defensive shape the pre-existing pg_hba branch already had.
+    manager: LockdownManagerLike
+    if not connection_lockdown_enabled:
+        manager = lockdown.NullLockdownManager()
+    elif lockdown_mechanism == "connection_limit" and connection_limit_state_path is not None:
+        manager = lockdown.ConnectionLimitLockdownManager(host, port, connection_limit_state_path)
+    elif lockdown_path is not None:
+        manager = lockdown.LockdownManager(host, port, lockdown_path)
+    else:
+        manager = lockdown.NullLockdownManager()
 
     try:
         if not _run_hooks(
@@ -582,6 +666,7 @@ def run_on_failure(
     context_file: str,
     *,
     lockdown_path: str | None = None,
+    connection_limit_state_path: str | None = None,
     host: str | None = None,
     port: str | None = None,
     hook_timeout_sec: float = 90,
@@ -593,23 +678,29 @@ def run_on_failure(
     main run and runs hooks.onFailure through the exact same
     run_hook() as every other stage -- no separate implementation.
 
-    Also unconditionally cleans up a lockdown file left behind by a
-    crash mid-lock, independent of any configured onFailure hooks --
-    see lockdown.cleanup_lockdown_file(). A no-op when lockdown_path is
-    None -- not a production case, since the on-failure unit's own
-    COLLATION_GUARD_LOCKDOWN_FILE is set regardless of
-    connectionLockdown.enable (see run()'s dry-run branch above for the
-    same fact); only a direct/test invocation without that env var set
-    hits this branch.
+    Also unconditionally cleans up whichever connectionLockdown
+    mechanism's state was left behind by a crash mid-lock, independent
+    of any configured onFailure hooks -- see
+    lockdown.cleanup_lockdown_file() (pg_hba.conf mechanism) and
+    lockdown.cleanup_connection_limit_lockdown() (the PostgreSQL < 16
+    fallback, docs/decisions/0009). Both run unconditionally and
+    independently of each other: the on-failure unit doesn't need to
+    know which mechanism the main run was actually configured with,
+    since each cleanup is already a no-op when its own path is None or
+    its own file doesn't exist -- only one of the two ever has
+    anything to do on a given deployment. Each is None in a
+    direct/test invocation without the corresponding env var set; both
+    are always set by the real on-failure unit (see run()'s dry-run
+    branch above for the same fact about COLLATION_GUARD_LOCKDOWN_FILE).
 
-    Both this cleanup step and loading the hooks file are wrapped
-    defensively: a failure in either (Postgres itself unreachable --
-    exactly the scenario that triggers this unit when
-    postgresql.service fails to start -- or a corrupt hooks file)
-    must never crash this entry point itself (see docs/decisions/0006).
-    That guarantee is asymmetric, though: a lockdown-cleanup failure is
-    logged and the configured onFailure hooks still run afterward, but
-    a hooks-file load failure is fatal to the hook run itself -- there's
+    Every cleanup step and loading the hooks file are wrapped
+    defensively: a failure in any of them (Postgres itself unreachable
+    -- exactly the scenario that triggers this unit when
+    postgresql.service fails to start -- or a corrupt hooks file) must
+    never crash this entry point itself (see docs/decisions/0006).
+    That guarantee is asymmetric, though: a cleanup failure is logged
+    and the configured onFailure hooks still run afterward, but a
+    hooks-file load failure is fatal to the hook run itself -- there's
     nothing left to execute -- so this returns 1 immediately with zero
     onFailure hooks run in that case."""
     if lockdown_path is not None:
@@ -618,8 +709,20 @@ def run_on_failure(
             lockdown.cleanup_lockdown_file(host, port, lockdown_path)
         except Exception as exc:
             logger.warning(
-                "lockdown cleanup during --on-failure raised: %s", exc, exc_info=True
+                "pg_hba lockdown cleanup during --on-failure raised: %s", exc, exc_info=True
             )
+
+    if connection_limit_state_path is not None:
+        assert host is not None and port is not None
+        try:
+            lockdown.cleanup_connection_limit_lockdown(host, port, connection_limit_state_path)
+        except Exception as exc:
+            logger.warning(
+                "connection-limit lockdown cleanup during --on-failure raised: %s",
+                exc,
+                exc_info=True,
+            )
+
 
     try:
         hooks = load_hooks(hooks_file)
@@ -681,6 +784,9 @@ def main() -> int:
             os.environ["COLLATION_GUARD_HOOKS_FILE"],
             os.environ["COLLATION_GUARD_CONTEXT_FILE"],
             lockdown_path=os.environ.get("COLLATION_GUARD_LOCKDOWN_FILE"),
+            connection_limit_state_path=os.environ.get(
+                "COLLATION_GUARD_CONNECTION_LIMIT_STATE_FILE"
+            ),
             host=os.environ.get("PGHOST"),
             port=os.environ.get("PGPORT"),
             hook_timeout_sec=hook_timeout_sec,
@@ -702,6 +808,8 @@ def main() -> int:
         connection_lockdown_enabled=(
             os.environ.get("COLLATION_GUARD_CONNECTION_LOCKDOWN_ENABLE", "true") == "true"
         ),
+        lockdown_mechanism=os.environ.get("COLLATION_GUARD_LOCKDOWN_MECHANISM", "pg_hba"),
+        connection_limit_state_path=os.environ.get("COLLATION_GUARD_CONNECTION_LIMIT_STATE_FILE"),
         hook_timeout_sec=hook_timeout_sec,
     )
 

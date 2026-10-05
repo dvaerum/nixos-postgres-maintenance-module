@@ -843,6 +843,93 @@ def test_run_on_failure_context_falls_back_to_empty_dict_with_no_context_file(tm
     assert json.loads(out.read_text()) == {}
 
 
+def test_run_restores_a_stale_connection_limit_state_before_doing_new_work(
+    pg_dsn: str, admin_conn: psycopg.Connection, tmp_path
+) -> None:
+    """The actual guarantee docs/decisions/0009 depends on for a
+    genuine machine-level crash (power loss, kernel panic -- nothing
+    graceful enough for the OnFailure= companion unit to ever fire at
+    all): main.run() itself must self-heal any stale lockdown state
+    left behind by a *previous* process, before doing any new work of
+    its own, on every single invocation -- not only via
+    run_on_failure(). Non-superuser role throughout -- CONNECTION
+    LIMIT never rejects a superuser (see
+    tests/test_connection_limit_lockdown.py)."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_stale_connection_limit"
+    state_path = tmp_path / "connection-limit-lockdown.json"
+    admin_conn.execute("DROP ROLE IF EXISTS cg_main_test_role_stale_cl")
+    admin_conn.execute("CREATE ROLE cg_main_test_role_stale_cl LOGIN")
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(f'CREATE DATABASE "{name}"')
+    admin_conn.execute(f'GRANT CONNECT ON DATABASE "{name}" TO cg_main_test_role_stale_cl')
+    # simulates a crash-while-locked state that survived a reboot
+    admin_conn.execute(f'ALTER DATABASE "{name}" CONNECTION LIMIT 0')
+    state_path.write_text(json.dumps({name: -1}))
+    try:
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(
+                f"host={host} port={port} dbname={name} user=cg_main_test_role_stale_cl",
+                prepare_threshold=None,
+            )
+
+        main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-locales",
+            partition_repair_enabled=True,
+            max_repair_attempts=10,
+            connection_limit_state_path=str(state_path),
+        )
+
+        assert not state_path.exists()
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name} user=cg_main_test_role_stale_cl",
+            prepare_threshold=None,
+        ):
+            pass
+    finally:
+        admin_conn.execute(f'ALTER DATABASE "{name}" CONNECTION LIMIT -1')
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute("DROP ROLE IF EXISTS cg_main_test_role_stale_cl")
+
+
+def test_run_restores_a_stale_pg_hba_lockdown_file_before_doing_new_work(
+    pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path
+) -> None:
+    """Same self-heal guarantee as the connection_limit test above,
+    applied to the pg_hba.conf mechanism -- defense in depth alongside
+    its own free tmpfs-wipe self-heal (docs/decisions/0009's own
+    explanation of why that one doesn't strictly need this, but gets
+    it anyway for consistency)."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_stale_pg_hba"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(f'CREATE DATABASE "{name}"')
+    lockdown_conf_path.write_text(f"local   {name}   all   reject\n")
+    admin_conn.execute("SELECT pg_reload_conf()")
+    try:
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None)
+
+        main.run(
+            host,
+            port,
+            glibc_locales_path="/nix/store/test-glibc-locales",
+            partition_repair_enabled=True,
+            max_repair_attempts=10,
+            lockdown_path=str(lockdown_conf_path),
+        )
+
+        assert not lockdown_conf_path.exists()
+        with psycopg.connect(f"host={host} port={port} dbname={name}", prepare_threshold=None):
+            pass
+    finally:
+        lockdown_conf_path.unlink(missing_ok=True)
+        admin_conn.execute("SELECT pg_reload_conf()")
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
 def test_run_locks_only_a_database_that_actually_needs_a_fix(
     pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path
 ) -> None:
@@ -1004,6 +1091,76 @@ def test_run_connection_lockdown_disabled_is_a_true_no_op(
         admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
 
 
+def test_run_locks_and_unlocks_via_the_connection_limit_fallback(
+    pg_dsn: str, admin_conn: psycopg.Connection, tmp_path
+) -> None:
+    """End-to-end wiring proof for lockdown_mechanism="connection_limit"
+    (docs/decisions/0009, the PostgreSQL < 16 fallback the Nix module
+    selects automatically) -- same scenario as
+    test_run_locks_and_unlocks_a_database_that_needs_a_fix, but through
+    main.run()'s mechanism-selection branch rather than the default
+    pg_hba one, and proven via a non-superuser role (CONNECTION LIMIT
+    never rejects a superuser -- see
+    tests/test_connection_limit_lockdown.py)."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_connection_limit_needs_fix"
+    state_path = tmp_path / "connection-limit-lockdown.json"
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(
+        f'CREATE DATABASE "{name}" LOCALE_PROVIDER libc LOCALE \'en_US.UTF-8\' '
+        f"TEMPLATE template0"
+    )
+    admin_conn.execute("DROP ROLE IF EXISTS cg_main_test_role_connection_limit")
+    admin_conn.execute("CREATE ROLE cg_main_test_role_connection_limit LOGIN")
+    admin_conn.execute(f'GRANT CONNECT ON DATABASE "{name}" TO cg_main_test_role_connection_limit')
+    try:
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name}", prepare_threshold=None
+        ) as conn:
+            conn.execute("CREATE TABLE widgets (id serial PRIMARY KEY, label text)")
+            conn.execute("INSERT INTO widgets (label) VALUES ('a'), ('b')")
+            conn.commit()
+            conn.execute(
+                "UPDATE pg_database SET datcollversion = 'not-the-real-version' "
+                "WHERE datname = current_database()"
+            )
+            conn.commit()
+
+        untagged = psycopg.connect(
+            f"host={host} port={port} dbname={name} user=cg_main_test_role_connection_limit",
+            prepare_threshold=None,
+        )
+        try:
+            main.run(
+                host,
+                port,
+                glibc_locales_path="/nix/store/test-glibc-locales",
+                partition_repair_enabled=True,
+                max_repair_attempts=10,
+                lockdown_mechanism="connection_limit",
+                connection_limit_state_path=str(state_path),
+            )
+
+            # terminated at some point during the run (locked, since a
+            # fix was genuinely needed), and immediately reconnectable
+            # again (as the same non-superuser role) once the run (and
+            # this database's own unlock) finished
+            with pytest.raises(psycopg.OperationalError):
+                untagged.execute("SELECT 1")
+            with psycopg.connect(
+                f"host={host} port={port} dbname={name} user=cg_main_test_role_connection_limit",
+                prepare_threshold=None,
+            ):
+                pass
+            assert not state_path.exists()
+        finally:
+            untagged.close()
+    finally:
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute("DROP ROLE IF EXISTS cg_main_test_role_connection_limit")
+
+
+
 def test_run_on_failure_cleans_up_an_active_lockdown_file(
     pg_dsn: str, admin_conn: psycopg.Connection, lockdown_conf_path, tmp_path
 ) -> None:
@@ -1101,6 +1258,120 @@ def test_run_on_failure_lockdown_cleanup_crash_does_not_block_the_hooks(tmp_path
     )
 
     assert marker.exists()
+
+
+def test_run_on_failure_cleans_up_an_active_connection_limit_lockdown(
+    pg_dsn: str, admin_conn: psycopg.Connection, tmp_path
+) -> None:
+    """Same crash-recovery scenario as
+    test_run_on_failure_cleans_up_an_active_lockdown_file, but for the
+    connection_limit fallback mechanism (docs/decisions/0009): a state
+    file on disk with a locked database's original limit, no running
+    manager at all. Proven via a non-superuser role -- see
+    tests/test_connection_limit_lockdown.py for why."""
+    host, port = _host_port(pg_dsn)
+    name = "cg_main_test_connection_limit_cleanup"
+    state_path = tmp_path / "connection-limit-lockdown.json"
+    admin_conn.execute("DROP ROLE IF EXISTS cg_main_test_role_cl_cleanup")
+    admin_conn.execute("CREATE ROLE cg_main_test_role_cl_cleanup LOGIN")
+    admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin_conn.execute(f'CREATE DATABASE "{name}"')
+    admin_conn.execute(f'GRANT CONNECT ON DATABASE "{name}" TO cg_main_test_role_cl_cleanup')
+    admin_conn.execute(f'ALTER DATABASE "{name}" CONNECTION LIMIT 0')
+    state_path.write_text(json.dumps({name: -1}))
+    try:
+        # sanity check: the simulated crash really did leave it locked
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(
+                f"host={host} port={port} dbname={name} user=cg_main_test_role_cl_cleanup",
+                prepare_threshold=None,
+            )
+
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text("{}")
+        context_file = tmp_path / "context.json"
+        context_file.write_text(json.dumps({"failures": [], "success": True}))
+
+        main.run_on_failure(
+            str(hooks_file),
+            str(context_file),
+            connection_limit_state_path=str(state_path),
+            host=host,
+            port=port,
+        )
+
+        assert not state_path.exists()
+        with psycopg.connect(
+            f"host={host} port={port} dbname={name} user=cg_main_test_role_cl_cleanup",
+            prepare_threshold=None,
+        ):
+            pass
+    finally:
+        state_path.unlink(missing_ok=True)
+        admin_conn.execute(f'ALTER DATABASE "{name}" CONNECTION LIMIT -1')
+        admin_conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        admin_conn.execute("DROP ROLE IF EXISTS cg_main_test_role_cl_cleanup")
+
+
+def test_run_on_failure_connection_limit_cleanup_is_a_no_op_when_no_file_exists(
+    tmp_path,
+) -> None:
+    hooks_file = tmp_path / "hooks.json"
+    hooks_file.write_text("{}")
+    context_file = tmp_path / "context.json"
+    context_file.write_text(json.dumps({"failures": [], "success": True}))
+
+    exit_code = main.run_on_failure(
+        str(hooks_file),
+        str(context_file),
+        connection_limit_state_path=str(tmp_path / "connection-limit-lockdown.json"),
+        host="unused",
+        port="unused",
+    )
+
+    assert exit_code == 0
+
+
+def test_run_on_failure_connection_limit_cleanup_crash_does_not_block_the_hooks(tmp_path) -> None:
+    """Same defensive guarantee as
+    test_run_on_failure_lockdown_cleanup_crash_does_not_block_the_hooks,
+    for cleanup_connection_limit_lockdown()'s own connection failure
+    path (the exact scenario that triggers this companion unit)."""
+    state_path = tmp_path / "connection-limit-lockdown.json"
+    state_path.write_text(json.dumps({"some_db": -1}))  # exists -> cleanup doesn't short-circuit
+
+    marker = tmp_path / "onfailure-ran"
+    hooks_file = tmp_path / "hooks.json"
+    hooks_file.write_text(
+        json.dumps(
+            {
+                "onFailure": [
+                    {
+                        "path": sys.executable,
+                        "args": ["-c", f"open({str(marker)!r}, 'w').close()"],
+                        "blockOnFailure": False,
+                        "environment": {},
+                        "environmentFile": None,
+                    }
+                ],
+            }
+        )
+    )
+
+    main.run_on_failure(
+        str(hooks_file),
+        str(tmp_path / "context.json"),  # missing -> _recover_last_context's own default path
+        connection_limit_state_path=str(state_path),
+        host="127.0.0.1",
+        port="1",  # nothing listens on port 1 -- the connect itself must fail
+    )
+
+    assert marker.exists()
+    # the connection failure must leave the state file in place -- see
+    # tests/test_connection_limit_lockdown.py's own test of this
+    assert state_path.exists()
+
+
 
 
 def test_run_processes_many_databases_correctly_under_real_concurrency(

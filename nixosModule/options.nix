@@ -152,6 +152,16 @@ in
           reason to allow concurrent connections during the guard's
           run. See
           docs/decisions/0007-connection-lockdown-during-repair.md.
+
+          The underlying mechanism is chosen automatically from the
+          configured `services.postgresql.package` version, with no
+          option change required: PostgreSQL 16+ uses a `pg_hba.conf`
+          rule (the above); PostgreSQL < 16 -- which predates the
+          `pg_hba.conf` directive that mechanism depends on -- falls
+          back to `ALTER DATABASE ... CONNECTION LIMIT`, which does
+          *not* reject a superuser connection (a narrower, but real and
+          clearly surfaced, guarantee). See
+          docs/decisions/0009-connection-limit-fallback-for-pg-lt-16.md.
         '';
       };
     };

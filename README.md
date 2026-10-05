@@ -125,7 +125,13 @@ mid-REINDEX or mid-repair, against inconsistent state. By default
 each database is rejected for new connections — and has any
 already-open session terminated — for exactly the duration it's
 actively being worked on, and only if it actually needs a fix; see
-`docs/decisions/0007-connection-lockdown-during-repair.md`.
+`docs/decisions/0007-connection-lockdown-during-repair.md`. The
+mechanism is chosen automatically from `services.postgresql.package`'s
+version — PostgreSQL 16+ uses a `pg_hba.conf` rule; PostgreSQL < 16
+falls back to `ALTER DATABASE ... CONNECTION LIMIT`, which doesn't
+reject a superuser connection (a narrower but real guarantee, surfaced
+via a NixOS build warning); see
+`docs/decisions/0009-connection-limit-fallback-for-pg-lt-16.md`.
 
 ## Usage
 

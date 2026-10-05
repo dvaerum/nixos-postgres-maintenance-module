@@ -9,4 +9,10 @@
   );
   preStartHook = pkgs.testers.nixosTest (import ./pre-start-hook.nix { inherit nixosModule; });
   onFailureHook = pkgs.testers.nixosTest (import ./on-failure-hook.nix { inherit nixosModule; });
+  pg15ConnectionLimitFallback = pkgs.testers.nixosTest (
+    import ./pg15-connection-limit-fallback.nix {
+      inherit nixosModule;
+      postgresql15 = pkgs.postgresql_15;
+    }
+  );
 }
