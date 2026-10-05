@@ -142,6 +142,16 @@ reason to allow concurrent connections during the guard’s
 run\. See
 docs/decisions/0007-connection-lockdown-during-repair\.md\.
 
+The underlying mechanism is chosen automatically from the
+configured ` services.postgresql.package ` version, with no
+option change required: PostgreSQL 16+ uses a ` pg_hba.conf `
+rule (the above); PostgreSQL \< 16 – which predates the
+` pg_hba.conf ` directive that mechanism depends on – falls
+back to ` ALTER DATABASE ... CONNECTION LIMIT `, which does
+*not* reject a superuser connection (a narrower, but real and
+clearly surfaced, guarantee)\. See
+docs/decisions/0009-connection-limit-fallback-for-pg-lt-16\.md\.
+
 
 
 *Type:*
@@ -1541,6 +1551,244 @@ positive integer, meaning >0
 
 ```nix
 3
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.upgrade\.enable
+
+
+
+Whether to orchestrate a PostgreSQL major-version upgrade
+(` pg_upgrade `) on the next boot, before ` postgresql.service `
+starts\. Must be set explicitly – never triggered
+automatically just because ` services.postgresql.package `’s
+major version differs from what’s on disk, unlike the
+always-on collation guard above (see
+docs/decisions/0011-upgrade-trigger-and-old-datadir-retention\.md)\.
+Idempotent by construction: safe to leave ` true ` indefinitely
+across any number of subsequent boots once the upgrade has
+completed, since the only gate is whether the *new* data
+directory already has its own cluster\.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+
+```nix
+false
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.upgrade\.initdbArgs
+
+
+
+Extra arguments passed to the new cluster’s own ` initdb `,
+run before ` pg_upgrade ` migrates data into it – mirrors
+` services.postgresql.initdbArgs ` so the resulting fresh
+cluster matches what a normal first boot under the new
+package would have produced\. Not read from
+` services.postgresql.initdbArgs ` automatically (that option
+is evaluated against the NEW package already, for the normal
+non-upgrade path) – set the same value here explicitly if
+needed\.
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+
+```nix
+[ ]
+```
+
+
+
+*Example:*
+
+```nix
+[
+  "--data-checksums"
+]
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.upgrade\.jobs
+
+
+
+` pg_upgrade `’s own ` --jobs ` – parallelizes per-database
+dump/restore and file transfer\. ` null ` leaves it unset
+(` pg_upgrade `’s own single-job default)\.
+
+
+
+*Type:*
+null or (positive integer, meaning >0)
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.upgrade\.oldDataDir
+
+
+
+The on-disk data directory for the OLD cluster referenced by
+` oldPackage ` above\. Defaults to the same convention
+` services.postgresql.dataDir ` itself uses – override only
+if the old cluster lives somewhere nonstandard\.
+
+
+
+*Type:*
+null or absolute path
+
+
+
+*Default:*
+
+```nix
+"/var/lib/postgresql/${oldPackage.psqlSchema}"
+```
+
+
+
+*Example:*
+
+```nix
+"/var/lib/postgresql/15"
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.upgrade\.oldDataDirRetentionDays
+
+
+
+Automatic cleanup of the old data directory after a
+successful upgrade\. ` null ` (default) keeps it forever – the
+safe default, since ` pg_upgrade `’s own documentation
+recommends keeping the old cluster until the new one is
+verified in production\. ` 0 ` deletes it immediately once the
+upgrade completes\. A positive N deletes it N days later, via
+a separate
+` postgresql-collation-guard-upgrade-cleanup.timer ` that
+checks once a day – independent of any particular boot,
+since this is calendar time elapsing, not a repeat upgrade
+run\. See
+docs/decisions/0011-upgrade-trigger-and-old-datadir-retention\.md\.
+
+
+
+*Type:*
+null or (unsigned integer, meaning >=0)
+
+
+
+*Default:*
+
+```nix
+null
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.upgrade\.oldPackage
+
+
+
+The PostgreSQL package the on-disk cluster at ` oldDataDir `
+is currently running – required whenever ` enable ` is ` true `
+(no safe default exists: this is validated directly against
+the real on-disk ` PG_VERSION ` before anything irreversible
+runs, see
+docs/decisions/0010-pg-upgrade-preflight-before-orchestration\.md)\.
+If the old cluster has extensions installed (e\.g\. PostGIS),
+pass the same ` .withPackages `-wrapped package it was
+originally configured with – ` pg_upgrade ` needs their
+shared libraries available to briefly start the old cluster\.
+
+
+
+*Type:*
+package
+
+
+
+*Example:*
+
+```nix
+pkgs.postgresql_15
+```
+
+*Declared by:*
+ - [/home/dennis/nixos-postgres-maintenance-module/nixosModule/options\.nix](file:///home/dennis/nixos-postgres-maintenance-module/nixosModule/options.nix)
+
+
+
+## services\.postgresqlCollationGuard\.upgrade\.transferMode
+
+
+
+How ` pg_upgrade ` transfers data from the old cluster into
+the new one\. ` "auto" ` picks ` "clone" ` (copy-on-write, same
+filesystem) when available, falling back to ` "copy" ` (a full
+independent duplicate, needs roughly 2x disk space)
+otherwise – but never ` "link" ` (hard links: the old
+cluster’s files are silently corrupted the moment the new
+cluster starts writing, so it only ever runs on an explicit,
+deliberate request, never a substitution ` "auto" ` makes on
+the caller’s behalf)\. See
+docs/decisions/0010-pg-upgrade-preflight-before-orchestration\.md\.
+
+
+
+*Type:*
+one of “auto”, “copy”, “clone”, “link”
+
+
+
+*Default:*
+
+```nix
+"auto"
 ```
 
 *Declared by:*

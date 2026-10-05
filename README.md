@@ -213,6 +213,51 @@ Default `true` -- see the explanation above and
 only if there's a specific reason to allow concurrent connections
 during the guard's run.
 
+### Major-version upgrades (`pg_upgrade`)
+
+A `pg_upgrade` to a new major version is one of the most common ways a
+cluster's collation library actually changes underneath it in the
+first place -- the new major's binary can easily be linked against a
+different glibc or ICU than the one the old cluster was initialized
+under (see `docs/decisions/0003`'s own glibc stamp, deliberately
+designed to survive exactly this). NixOS's own `services.postgresql`
+module has no built-in major-version-upgrade mechanism at all, leaving
+it as an entirely manual, undocumented dance otherwise. This module
+closes that gap too:
+
+```nix
+services.postgresql.package = pkgs.postgresql_17; # the NEW version
+services.postgresqlCollationGuard.upgrade = {
+  enable = true;
+  oldPackage = pkgs.postgresql_16; # whatever is CURRENTLY on disk
+};
+```
+
+`upgrade.enable` must be set explicitly -- unlike the always-on
+collation guard above, this is a one-way data migration, never
+triggered automatically just because `services.postgresql.package`'s
+major version differs from what's on disk. It's also idempotent by
+construction: safe to leave `enable = true` indefinitely across any
+number of subsequent `nixos-rebuild switch`es once the upgrade has
+actually completed, since the only gate is whether the *new* data
+directory already has its own cluster. A new
+`postgresql-collation-guard-upgrade.service` unit runs strictly
+*before* `postgresql.service` starts (the opposite ordering from the
+main guard above, which needs a live connection) -- initializing the
+new data directory and running the real `pg_upgrade` binary, so
+`postgresql.service`'s own first-boot `initdb` never gets a chance to
+silently create an empty cluster at the new version's data directory
+path first.
+
+The old data directory is kept after a successful upgrade, by default
+forever -- `pg_upgrade`'s own documentation recommends keeping it until
+the new cluster is verified in production. `transferMode` (default
+`"auto"`), `jobs`, `initdbArgs`, and a time-gated
+`oldDataDirRetentionDays` for automatic cleanup are all configurable
+too -- see `docs/decisions/0010-pg-upgrade-preflight-before-orchestration.md`
+and `docs/decisions/0011-upgrade-trigger-and-old-datadir-retention.md`
+for the full design reasoning, or `docs/options.md` for every option.
+
 ### CLI
 
 ```
@@ -259,6 +304,9 @@ nix flake check      # fast tier + slow (systemd-nspawn) tier + the Nix package 
 nix build .#icuDriftTest -L   # heaviest tier: real ICU-drift test, two full Postgres
                                # rebuilds -- not part of `nix flake check`/CI, see
                                # docs/decisions/0008; run by hand only
+nix build .#pgUpgradeTest -L  # heaviest tier: real pg_upgrade across two major versions --
+                               # not part of `nix flake check`/CI, see docs/decisions/0010;
+                               # run by hand only
 nix fmt              # format Nix files (nixfmt-rfc-style) -- no Python formatter is wired in
 nix-build generate-doc.nix && cp result docs/options.md   # regenerate the option reference
 ```
