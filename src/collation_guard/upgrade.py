@@ -1,19 +1,26 @@
-"""PostgreSQL major-version upgrade: detection, validation, and preflight
-checks for whether/how to run pg_upgrade (docs/decisions/0010). Deliberately
-split from the actual initdb/pg_upgrade orchestration (not yet implemented
-here): every function below is pure or near-pure (reads real on-disk/
-filesystem state, makes no irreversible change), so it's fully covered by
-the fast pytest tier with no second real Postgres binary needed -- the
-orchestration itself is proven separately against a real two-major-version
-cluster (see the heavy-tier packages.pgUpgradeTest, not wired into this
-fast tier -- same precedent as docs/decisions/0008's icuDriftTest).
+"""PostgreSQL major-version upgrade: detection, validation, preflight
+checks, and orchestration for pg_upgrade (docs/decisions/0010, 0011).
+Most functions below are pure or near-pure (read real on-disk/
+filesystem state, make no irreversible change) and fully covered by
+the fast pytest tier with no second real Postgres binary needed.
+initdb_new_cluster()/run_pg_upgrade() are the exception -- they invoke
+real subprocesses -- but their own argv-construction and error-handling
+contract is still proven here against a mocked subprocess.run; a real
+initdb/pg_upgrade invocation against an actual two-major-version
+cluster is proven separately (see the heavy-tier packages.pgUpgradeTest,
+not wired into this fast tier -- same precedent as docs/decisions/0008's
+icuDriftTest).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import tempfile
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 
 class VersionMismatchError(Exception):
@@ -37,6 +44,19 @@ class TransferModeUnavailableError(Exception):
     reflink support). Deliberately never silently substituted for a
     different mode -- only "auto" is allowed to make that call on the
     caller's behalf (see resolve_transfer_mode)."""
+
+
+class InitdbFailedError(Exception):
+    """Raised when the new cluster's own initdb (run against an empty
+    new data directory, before pg_upgrade touches anything) exits
+    non-zero."""
+
+
+class PgUpgradeFailedError(Exception):
+    """Raised when the real pg_upgrade binary exits non-zero. Includes
+    stderr: pg_upgrade's own exit status alone names none of the actual
+    incompatibility (a leftover extension, a catalog mismatch) an
+    operator needs to see to fix it."""
 
 
 def read_pg_version(datadir: str) -> str | None:
@@ -199,4 +219,159 @@ def resolve_transfer_mode(requested: str, *, old_datadir: str, new_datadir_paren
         return "copy"
 
     raise ValueError(f"unknown transfer mode: {requested!r}")
+
+
+def initdb_new_cluster(
+    new_bindir: str,
+    new_datadir: str,
+    superuser: str,
+    *,
+    initdb_args: list[str] | None = None,
+) -> None:
+    """Initializes the new cluster's empty data directory via the new
+    binary's own initdb, mirroring nixpkgs's own postgresql.service
+    preStart invocation (same -U, same extra initdbArgs) exactly -- the
+    resulting fresh cluster must be indistinguishable from one NixOS
+    would have initialized itself, since pg_upgrade() below migrates
+    the old cluster's actual data into it afterward, not around it."""
+    args = [
+        os.path.join(new_bindir, "initdb"),
+        "-D",
+        new_datadir,
+        "-U",
+        superuser,
+        *(initdb_args or []),
+    ]
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise InitdbFailedError(
+            f"initdb for the new cluster at {new_datadir} failed (exit "
+            f"{result.returncode}): {result.stderr.strip()}"
+        )
+
+
+_TRANSFER_MODE_FLAGS: dict[str, str | None] = {"copy": None, "clone": "--clone", "link": "--link"}
+
+
+def run_pg_upgrade(
+    *,
+    old_bindir: str,
+    new_bindir: str,
+    old_datadir: str,
+    new_datadir: str,
+    transfer_mode: str,
+    superuser: str,
+    jobs: int | None = None,
+) -> None:
+    """Invokes the real pg_upgrade binary (shipped alongside new_bindir)
+    to migrate old_datadir's cluster into new_datadir, already
+    initialized by initdb_new_cluster() above. transfer_mode must
+    already be resolved to a concrete pg_upgrade flag by
+    resolve_transfer_mode() -- "auto" has no pg_upgrade equivalent, so a
+    caller that forgets to resolve it first fails loudly here with a
+    ValueError, not a literal, nonsense "--auto" argv token passed
+    through to the real binary. "copy" is pg_upgrade's own default and
+    needs no flag at all.
+
+    Runs with cwd=new_datadir: pg_upgrade writes its own log files
+    (pg_upgrade_internal.log, loadable_libraries.txt, ...) into the
+    current directory, and new_datadir is guaranteed writable by
+    whichever user is running this (initdb_new_cluster() just created
+    it), unlike wherever this process happened to be started from.
+    """
+    if transfer_mode not in _TRANSFER_MODE_FLAGS:
+        raise ValueError(
+            f"unknown transfer mode for pg_upgrade: {transfer_mode!r} -- must already be "
+            'resolved to "copy", "clone", or "link" by resolve_transfer_mode()'
+        )
+
+    args = [
+        os.path.join(new_bindir, "pg_upgrade"),
+        "--old-bindir",
+        old_bindir,
+        "--new-bindir",
+        new_bindir,
+        "--old-datadir",
+        old_datadir,
+        "--new-datadir",
+        new_datadir,
+        "--username",
+        superuser,
+    ]
+    flag = _TRANSFER_MODE_FLAGS[transfer_mode]
+    if flag is not None:
+        args.append(flag)
+    if jobs is not None:
+        args.extend(["--jobs", str(jobs)])
+
+    result = subprocess.run(args, capture_output=True, text=True, cwd=new_datadir)
+    if result.returncode != 0:
+        raise PgUpgradeFailedError(
+            f"pg_upgrade from {old_datadir} to {new_datadir} failed (exit "
+            f"{result.returncode}): {result.stderr.strip()}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UpgradeCompletion:
+    """What a later cleanup timer needs to know: which old data
+    directory is now eligible for removal, and when the upgrade that
+    made it eligible actually finished (docs/decisions/0011's
+    oldDataDirRetentionDays window is measured from this moment)."""
+
+    old_datadir: str
+    completed_at: datetime
+
+
+def record_upgrade_completion(
+    state_file: str, old_datadir: str, *, now: datetime | None = None
+) -> None:
+    """Records that a pg_upgrade finished successfully. Written
+    atomically (temp file + os.replace, same directory) -- same pattern
+    as 0009's connection-limit state file: a process killed mid-write
+    must never leave a corrupt file behind for the retention timer
+    (docs/decisions/0011) to choke on later."""
+    moment = now if now is not None else datetime.now(UTC)
+    payload = json.dumps({"old_datadir": old_datadir, "completed_at": moment.isoformat()})
+    state_dir = os.path.dirname(state_file) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix=".upgrade-completed-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        os.replace(tmp_path, state_file)
+    except BaseException:
+        os.remove(tmp_path)
+        raise
+
+
+def read_upgrade_completion(state_file: str) -> UpgradeCompletion | None:
+    """None when no upgrade has completed yet (the common case, and the
+    state before any upgrade.enable transition has ever run) -- not an
+    error, same "missing means nothing to report yet" shape as
+    read_pg_version() above."""
+    try:
+        with open(state_file) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    return UpgradeCompletion(
+        old_datadir=data["old_datadir"],
+        completed_at=datetime.fromisoformat(data["completed_at"]),
+    )
+
+
+def old_datadir_due_for_cleanup(
+    completed_at: datetime, retention_days: int | None, *, now: datetime | None = None
+) -> bool:
+    """Pure predicate for docs/decisions/0011's oldDataDirRetentionDays
+    window: None means "keep forever" (never due); 0 means due the
+    moment the upgrade completed (no waiting period); N>0 means due N
+    days after completed_at. Evaluated against elapsed *calendar* time,
+    not a repeat run of the upgrade unit itself -- that unit only ever
+    runs once per transition (docs/decisions/0011), so a separate timer
+    is what calls this, independent of any particular boot."""
+    if retention_days is None:
+        return False
+    moment = now if now is not None else datetime.now(UTC)
+    return moment >= completed_at + timedelta(days=retention_days)
 

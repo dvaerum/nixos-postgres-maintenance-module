@@ -1,15 +1,18 @@
-"""Fast tier: upgrade.py's detection/validation/preflight logic for
-docs/decisions/0010 (PostgreSQL major-version upgrade support). Pure
-functions wherever possible -- no second real Postgres binary needed
-here; the full initdb/pg_upgrade orchestration is proven separately
-against a real two-major-version cluster (see the heavy-tier
-packages.pgUpgradeTest, not wired into this fast tier -- same
-precedent as docs/decisions/0008's icuDriftTest).
+"""Fast tier: upgrade.py's detection/validation/preflight/orchestration
+logic for docs/decisions/0010 and 0011 (PostgreSQL major-version
+upgrade support). Pure functions wherever possible; the orchestration
+functions (initdb_new_cluster/run_pg_upgrade) mock subprocess.run
+throughout -- what's proven here is the argv/error-handling contract,
+not a real initdb/pg_upgrade binary. The full orchestration against a
+real two-major-version cluster is proven separately (see the
+heavy-tier packages.pgUpgradeTest, not wired into this fast tier --
+same precedent as docs/decisions/0008's icuDriftTest).
 """
 
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -297,3 +300,245 @@ def test_resolve_transfer_mode_auto_never_falls_back_to_link(
 def test_resolve_transfer_mode_rejects_an_unknown_mode() -> None:
     with pytest.raises(ValueError, match="nonsense"):
         upgrade.resolve_transfer_mode("nonsense", old_datadir="/old", new_datadir_parent="/new")
+
+
+# -- initdb_new_cluster() / run_pg_upgrade(): orchestration (docs/decisions/0010,
+# docs/decisions/0011) -- subprocess is always mocked here, same as
+# reflink_supported()'s own tests above: a real pg_upgrade/initdb invocation
+# needs a second real Postgres major-version binary, proven separately by the
+# heavy-tier packages.pgUpgradeTest (not yet implemented), not this fast tier.
+
+
+def test_initdb_new_cluster_invokes_the_new_binarys_own_initdb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded["args"] = args
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    upgrade.initdb_new_cluster("/new/bin", "/new/data", "postgres")
+    assert recorded["args"] == [
+        "/new/bin/initdb",
+        "-D",
+        "/new/data",
+        "-U",
+        "postgres",
+    ]
+
+
+def test_initdb_new_cluster_passes_through_extra_initdb_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors nixpkgs's own postgresql.service preStart, which passes
+    services.postgresql.initdbArgs through unchanged -- the resulting
+    fresh cluster must be indistinguishable from one NixOS would have
+    initialized itself, so the same extra args have to reach initdb
+    here too."""
+    recorded: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded["args"] = args
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    upgrade.initdb_new_cluster(
+        "/new/bin", "/new/data", "postgres", initdb_args=["--data-checksums"]
+    )
+    assert recorded["args"][-1] == "--data-checksums"
+
+
+def test_initdb_new_cluster_raises_with_stderr_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    with pytest.raises(upgrade.InitdbFailedError, match="boom"):
+        upgrade.initdb_new_cluster("/new/bin", "/new/data", "postgres")
+
+
+def test_run_pg_upgrade_builds_the_expected_argv_for_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"copy" is pg_upgrade's own default -- no mode flag at all, unlike
+    "clone"/"link" below."""
+    recorded: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded["args"] = args
+        recorded["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    upgrade.run_pg_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir="/old/data",
+        new_datadir="/new/data",
+        transfer_mode="copy",
+        superuser="postgres",
+    )
+    assert recorded["args"] == [
+        "/new/bin/pg_upgrade",
+        "--old-bindir",
+        "/old/bin",
+        "--new-bindir",
+        "/new/bin",
+        "--old-datadir",
+        "/old/data",
+        "--new-datadir",
+        "/new/data",
+        "--username",
+        "postgres",
+    ]
+    # Writes its own log files alongside the new cluster, not wherever
+    # the calling process happened to start -- the new datadir is
+    # guaranteed writable (initdb_new_cluster() just created it).
+    assert recorded["kwargs"]["cwd"] == "/new/data"
+
+
+def test_run_pg_upgrade_adds_the_clone_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded["args"] = args
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    upgrade.run_pg_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir="/old/data",
+        new_datadir="/new/data",
+        transfer_mode="clone",
+        superuser="postgres",
+    )
+    assert "--clone" in recorded["args"]
+
+
+def test_run_pg_upgrade_adds_the_link_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded["args"] = args
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    upgrade.run_pg_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir="/old/data",
+        new_datadir="/new/data",
+        transfer_mode="link",
+        superuser="postgres",
+    )
+    assert "--link" in recorded["args"]
+
+
+def test_run_pg_upgrade_passes_jobs_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded["args"] = args
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    upgrade.run_pg_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir="/old/data",
+        new_datadir="/new/data",
+        transfer_mode="copy",
+        superuser="postgres",
+        jobs=4,
+    )
+    assert recorded["args"][-2:] == ["--jobs", "4"]
+
+
+def test_run_pg_upgrade_rejects_auto_as_an_unresolved_mode() -> None:
+    """"auto" is resolve_transfer_mode()'s own job to resolve away --
+    pg_upgrade itself has no such mode, so a caller that forgets to
+    resolve it first must fail loudly, not silently pass "auto" through
+    as a literal (nonsense) argv token."""
+    with pytest.raises(ValueError, match="auto"):
+        upgrade.run_pg_upgrade(
+            old_bindir="/old/bin",
+            new_bindir="/new/bin",
+            old_datadir="/old/data",
+            new_datadir="/new/data",
+            transfer_mode="auto",
+            superuser="postgres",
+        )
+
+
+def test_run_pg_upgrade_raises_with_stderr_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="catalog mismatch")
+
+    monkeypatch.setattr(upgrade.subprocess, "run", fake_run)
+    with pytest.raises(upgrade.PgUpgradeFailedError, match="catalog mismatch"):
+        upgrade.run_pg_upgrade(
+            old_bindir="/old/bin",
+            new_bindir="/new/bin",
+            old_datadir="/old/data",
+            new_datadir="/new/data",
+            transfer_mode="copy",
+            superuser="postgres",
+        )
+
+
+# -- Upgrade-completion stamp + time-gated old-dataDir retention
+# (docs/decisions/0011) --
+
+
+def test_record_and_read_upgrade_completion_round_trips(tmp_path: Path) -> None:
+    state_file = str(tmp_path / "upgrade-completed.json")
+    completed_at = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+    upgrade.record_upgrade_completion(state_file, "/old/data", now=completed_at)
+
+    result = upgrade.read_upgrade_completion(state_file)
+    assert result is not None
+    assert result.old_datadir == "/old/data"
+    assert result.completed_at == completed_at
+
+
+def test_read_upgrade_completion_returns_none_when_missing(tmp_path: Path) -> None:
+    assert upgrade.read_upgrade_completion(str(tmp_path / "nope.json")) is None
+
+
+def test_record_upgrade_completion_writes_atomically(tmp_path: Path) -> None:
+    """Temp file + os.replace, same directory -- same pattern as
+    0009's connection-limit state file: a process killed mid-write must
+    never leave a corrupt file behind for a later cleanup timer to
+    choke on."""
+    state_file = str(tmp_path / "upgrade-completed.json")
+    upgrade.record_upgrade_completion(state_file, "/old/data")
+    # No leftover temp files in the directory once the write completes.
+    assert list(tmp_path.iterdir()) == [tmp_path / "upgrade-completed.json"]
+
+
+def test_old_datadir_due_for_cleanup_never_when_retention_is_none() -> None:
+    completed_at = datetime(2020, 1, 1, tzinfo=UTC)
+    far_future = datetime(2030, 1, 1, tzinfo=UTC)
+    assert upgrade.old_datadir_due_for_cleanup(completed_at, None, now=far_future) is False
+
+
+def test_old_datadir_due_for_cleanup_immediately_when_retention_is_zero() -> None:
+    completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    assert upgrade.old_datadir_due_for_cleanup(completed_at, 0, now=completed_at) is True
+
+
+def test_old_datadir_due_for_cleanup_before_the_window_elapses() -> None:
+    completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    nine_days_later = completed_at + timedelta(days=9)
+    assert upgrade.old_datadir_due_for_cleanup(completed_at, 10, now=nine_days_later) is False
+
+
+def test_old_datadir_due_for_cleanup_once_the_window_elapses() -> None:
+    completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    ten_days_later = completed_at + timedelta(days=10)
+    assert upgrade.old_datadir_due_for_cleanup(completed_at, 10, now=ten_days_later) is True
