@@ -12,7 +12,7 @@ from collections.abc import Iterator
 import psycopg
 import pytest
 
-from collation_guard import collation, main, partitions
+from collation_guard import collation, main, partitions, upgrade
 from collation_guard.hooks import Hook, HooksConfig, PerDatabaseHooks
 from conftest import _host_port
 
@@ -1800,3 +1800,96 @@ def test_run_glibc_stamp_reindex_failure_does_not_mark_database_already_reindexe
             f"host={host} port={port} dbname=postgres", autocommit=True, prepare_threshold=None
         ) as admin:
             admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+# -- --upgrade CLI dispatch (docs/decisions/0010, 0011) --
+
+
+def _set_required_upgrade_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_OLD_BINDIR", "/old/bin")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_NEW_BINDIR", "/new/bin")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR", "/old/data")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_NEW_DATADIR", "/new/data")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_OLD_SCHEMA", "15")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_NEW_SCHEMA", "16")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE", "/var/lib/x/completed.json")
+
+
+def test_main_upgrade_flag_dispatches_with_expected_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_upgrade(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(main.upgrade, "run_upgrade", fake_run_upgrade)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+
+    assert main.main() == 0
+    assert captured["old_bindir"] == "/old/bin"
+    assert captured["new_bindir"] == "/new/bin"
+    assert captured["old_datadir"] == "/old/data"
+    assert captured["new_datadir"] == "/new/data"
+    assert captured["old_schema"] == "15"
+    assert captured["new_schema"] == "16"
+    assert captured["completion_state_file"] == "/var/lib/x/completed.json"
+    # Defaults, neither env var set below.
+    assert captured["superuser"] == "postgres"
+    assert captured["transfer_mode"] == "auto"
+    assert captured["jobs"] is None
+    assert captured["initdb_args"] is None
+
+
+def test_main_upgrade_flag_passes_through_optional_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_upgrade(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        return False
+
+    monkeypatch.setattr(main.upgrade, "run_upgrade", fake_run_upgrade)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_SUPERUSER", "dbadmin")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_TRANSFER_MODE", "link")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_JOBS", "4")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_INITDB_ARGS", json.dumps(["--data-checksums"]))
+
+    assert main.main() == 0
+    assert captured["superuser"] == "dbadmin"
+    assert captured["transfer_mode"] == "link"
+    assert captured["jobs"] == 4
+    assert captured["initdb_args"] == ["--data-checksums"]
+
+
+def test_main_upgrade_flag_returns_0_even_when_no_upgrade_was_needed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main.upgrade, "run_upgrade", lambda **k: False)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+
+    assert main.main() == 0
+
+
+def test_main_upgrade_flag_lets_version_mismatch_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A VersionMismatchError here is a real, actionable misconfiguration
+    -- this project's usual "crash loud" behavior for a hard failure,
+    not a quiet return 1 (see run_upgrade_entrypoint's own docstring)."""
+
+    def fake_run_upgrade(**kwargs: object) -> bool:
+        raise upgrade.VersionMismatchError("on-disk PG_VERSION disagrees with oldPackage")
+
+    monkeypatch.setattr(main.upgrade, "run_upgrade", fake_run_upgrade)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+
+    with pytest.raises(upgrade.VersionMismatchError):
+        main.main()

@@ -1,7 +1,9 @@
 """Entry point: orchestrates collation.py + partitions.py across every
 database in the cluster. Driven entirely by environment variables set
 by the NixOS module (see nixosModule/config.nix) -- there is no config
-file, and --dry-run is the only CLI flag.
+file. --dry-run is the only user-facing CLI flag; --on-failure and
+--upgrade are internal, invoked only by their own companion systemd
+units (see run_on_failure()/run_upgrade_entrypoint() below).
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 
 import psycopg
 
-from . import collation, lockdown, partitions
+from . import collation, lockdown, partitions, upgrade
 from .hooks import Hook, HooksConfig, load_hooks, run_hook
 
 logger = logging.getLogger("collation_guard")
@@ -745,6 +747,53 @@ def run_on_failure(
     return 0 if report.success else 1
 
 
+def run_upgrade_entrypoint(
+    *,
+    old_bindir: str,
+    new_bindir: str,
+    old_datadir: str,
+    new_datadir: str,
+    old_schema: str,
+    new_schema: str,
+    superuser: str,
+    completion_state_file: str,
+    transfer_mode: str = "auto",
+    jobs: int | None = None,
+    initdb_args: list[str] | None = None,
+) -> int:
+    """Third entry point, invoked by the postgresql-collation-guard-
+    upgrade.service unit -- ordered Before=["postgresql.service"]
+    (docs/decisions/0011), strictly before either the old or new
+    cluster's own postgres process ever starts. Unlike run()/
+    run_on_failure() above, this never opens a live connection at all:
+    pg_upgrade manages both clusters' startup/shutdown internally.
+
+    A VersionMismatchError raised by upgrade.run_upgrade() here is a
+    real, actionable misconfiguration (the on-disk old cluster isn't
+    what oldPackage claims) and is deliberately allowed to propagate as
+    an uncaught exception -- the same "crash loud, let the journal and
+    non-zero exit code carry it" behavior as every other hard failure
+    in this project, not swallowed into a quiet return 1."""
+    upgraded = upgrade.run_upgrade(
+        old_bindir=old_bindir,
+        new_bindir=new_bindir,
+        old_datadir=old_datadir,
+        new_datadir=new_datadir,
+        old_schema=old_schema,
+        new_schema=new_schema,
+        superuser=superuser,
+        transfer_mode=transfer_mode,
+        jobs=jobs,
+        initdb_args=initdb_args,
+        completion_state_file=completion_state_file,
+    )
+    if upgraded:
+        logger.info("pg_upgrade completed: %s -> %s", old_datadir, new_datadir)
+    else:
+        logger.info("upgrade.enable is set but no upgrade was needed -- nothing to do")
+    return 0
+
+
 
 def _write_context_file(path: str, report: RunReport) -> None:
     # Best-effort: a hook-context write failure is a hook-delivery
@@ -775,9 +824,34 @@ def main() -> int:
             "directly"
         ),
     )
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help=(
+            "internal: invoked by the postgresql-collation-guard-upgrade.service unit "
+            "before postgresql.service starts -- not meant to be run directly"
+        ),
+    )
     args = parser.parse_args()
 
     hook_timeout_sec = float(os.environ.get("COLLATION_GUARD_HOOK_TIMEOUT_SEC", "90"))
+
+    if args.upgrade:
+        jobs_env = os.environ.get("COLLATION_GUARD_UPGRADE_JOBS")
+        initdb_args_env = os.environ.get("COLLATION_GUARD_UPGRADE_INITDB_ARGS")
+        return run_upgrade_entrypoint(
+            old_bindir=os.environ["COLLATION_GUARD_UPGRADE_OLD_BINDIR"],
+            new_bindir=os.environ["COLLATION_GUARD_UPGRADE_NEW_BINDIR"],
+            old_datadir=os.environ["COLLATION_GUARD_UPGRADE_OLD_DATADIR"],
+            new_datadir=os.environ["COLLATION_GUARD_UPGRADE_NEW_DATADIR"],
+            old_schema=os.environ["COLLATION_GUARD_UPGRADE_OLD_SCHEMA"],
+            new_schema=os.environ["COLLATION_GUARD_UPGRADE_NEW_SCHEMA"],
+            superuser=os.environ.get("COLLATION_GUARD_UPGRADE_SUPERUSER", "postgres"),
+            completion_state_file=os.environ["COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"],
+            transfer_mode=os.environ.get("COLLATION_GUARD_UPGRADE_TRANSFER_MODE", "auto"),
+            jobs=int(jobs_env) if jobs_env else None,
+            initdb_args=json.loads(initdb_args_env) if initdb_args_env else None,
+        )
 
     if args.on_failure:
         return run_on_failure(
