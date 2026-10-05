@@ -26,6 +26,21 @@ let
   # of every single run, not just via OnFailure=.
   connectionLimitStateFile = "/var/lib/postgresql-collation-guard/connection-limit-lockdown.json";
 
+  # Same /var/lib persistence reasoning as connectionLimitStateFile just
+  # above: oldDataDirRetentionDays's retention window (docs/decisions/0011)
+  # is measured in calendar time from this file's own completed_at, which
+  # must survive a reboot for a positive window to mean anything at all.
+  upgradeCompletionStateFile = "/var/lib/postgresql-collation-guard/upgrade-completed.json";
+
+  # Only the *positive*-day case needs the separate timer below --
+  # retention 0 ("delete immediately") is handled inline by
+  # upgrade.run_upgrade() itself, in the same run as the upgrade
+  # (docs/decisions/0011).
+  hasPositiveRetention =
+    cfg.upgrade.enable
+    && cfg.upgrade.oldDataDirRetentionDays != null
+    && cfg.upgrade.oldDataDirRetentionDays > 0;
+
   # pg_hba.conf's include_if_exists (what the pg_hba mechanism relies on
   # to inject/retract lockdownFile at runtime -- see the mkBefore below
   # and docs/decisions/0007) was added in PostgreSQL 16, not before:
@@ -249,6 +264,113 @@ in
     systemd.services.postgresql-setup = {
       requires = [ "postgresql-collation-guard.service" ];
       after = [ "postgresql-collation-guard.service" ];
+    };
+
+    # Same convention services.postgresql.dataDir itself uses -- see
+    # nixpkgs's own postgresql.nix. mkDefault here, not in options.nix:
+    # options.nix is evaluated standalone (with no real
+    # services.postgresql present) by generate-doc.nix, so any default
+    # that reads another option's value belongs in this file instead
+    # (same reason onFailureService.user's own real default is set here,
+    # not in options.nix).
+    services.postgresqlCollationGuard.upgrade.oldDataDir = lib.mkIf cfg.upgrade.enable (
+      lib.mkDefault "/var/lib/postgresql/${cfg.upgrade.oldPackage.psqlSchema}"
+    );
+
+    systemd.services.postgresql-collation-guard-upgrade = lib.mkIf cfg.upgrade.enable {
+      description = "Orchestrate a PostgreSQL major-version upgrade (pg_upgrade) before postgresql.service starts";
+
+      # Deliberately the OPPOSITE ordering from the main guard unit
+      # above: this must run strictly BEFORE either the old or new
+      # cluster's own postgres process ever starts (pg_upgrade manages
+      # both internally) -- not after, like the main guard (which needs
+      # a live connection, docs/decisions/0007). `before` here is just
+      # the ordering hint; what actually pulls this unit into the boot
+      # graph is systemd.services.postgresql's own requires/after below,
+      # the same two-sided pattern the main guard/postgresql-setup pair
+      # above already uses.
+      before = [ "postgresql.service" ];
+
+      unitConfig.RequiresMountsFor = [
+        cfg.upgrade.oldDataDir
+        pgCfg.dataDir
+      ];
+
+      environment = {
+        COLLATION_GUARD_UPGRADE_OLD_BINDIR = "${cfg.upgrade.oldPackage}/bin";
+        COLLATION_GUARD_UPGRADE_NEW_BINDIR = "${pgCfg.finalPackage}/bin";
+        COLLATION_GUARD_UPGRADE_OLD_DATADIR = cfg.upgrade.oldDataDir;
+        COLLATION_GUARD_UPGRADE_NEW_DATADIR = pgCfg.dataDir;
+        COLLATION_GUARD_UPGRADE_OLD_SCHEMA = cfg.upgrade.oldPackage.psqlSchema;
+        COLLATION_GUARD_UPGRADE_NEW_SCHEMA = pgCfg.package.psqlSchema;
+        COLLATION_GUARD_UPGRADE_SUPERUSER = pgCfg.superUser;
+        COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE = upgradeCompletionStateFile;
+        COLLATION_GUARD_UPGRADE_TRANSFER_MODE = cfg.upgrade.transferMode;
+      }
+      // lib.optionalAttrs (cfg.upgrade.jobs != null) {
+        COLLATION_GUARD_UPGRADE_JOBS = toString cfg.upgrade.jobs;
+      }
+      // lib.optionalAttrs (cfg.upgrade.initdbArgs != [ ]) {
+        COLLATION_GUARD_UPGRADE_INITDB_ARGS = builtins.toJSON cfg.upgrade.initdbArgs;
+      }
+      // lib.optionalAttrs (cfg.upgrade.oldDataDirRetentionDays != null) {
+        COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS = toString cfg.upgrade.oldDataDirRetentionDays;
+      };
+
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = pgCfg.superUser;
+        Group = "postgres";
+        # Same hardening rationale as the main unit above: nothing here
+        # needs privilege escalation or a shared /tmp, but ReadWritePaths
+        # tuning for the old/new data directories would need case-by-case
+        # care (their parent, /var/lib/postgresql, is itself the default
+        # StateDirectory owner for the NEW cluster -- see nixpkgs's own
+        # postgresql.nix), so no broader ProtectSystem/-Home default here
+        # either.
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ExecStart = "${lib.getExe cfg.package} --upgrade";
+      };
+    };
+
+    # Pulls postgresql-collation-guard-upgrade.service into the boot
+    # graph and orders postgresql.service after it -- the `before` set
+    # on the upgrade unit itself (above) is only an ordering hint and
+    # doesn't by itself cause anything to start it. Same two-sided
+    # pattern as postgresql-setup's own requires/after on the main guard
+    # unit. Requires= (not just After=) is deliberate: if the upgrade
+    # unit fails, postgresql.service must not start at all against a
+    # half-migrated data directory.
+    systemd.services.postgresql = lib.mkIf cfg.upgrade.enable {
+      requires = [ "postgresql-collation-guard-upgrade.service" ];
+      after = [ "postgresql-collation-guard-upgrade.service" ];
+    };
+
+    systemd.timers.postgresql-collation-guard-upgrade-cleanup = lib.mkIf hasPositiveRetention {
+      description = "Check whether the retained old PostgreSQL data directory is due for cleanup";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "15min";
+        OnUnitActiveSec = "1d";
+      };
+    };
+
+    systemd.services.postgresql-collation-guard-upgrade-cleanup = lib.mkIf hasPositiveRetention {
+      description = "Remove the retained old PostgreSQL data directory once its retention window has elapsed";
+      environment = {
+        COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE = upgradeCompletionStateFile;
+        COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS = toString cfg.upgrade.oldDataDirRetentionDays;
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        User = pgCfg.superUser;
+        Group = "postgres";
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ExecStart = "${lib.getExe cfg.package} --upgrade-cleanup";
+      };
     };
   };
 }
