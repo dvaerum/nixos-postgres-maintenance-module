@@ -1893,3 +1893,72 @@ def test_main_upgrade_flag_lets_version_mismatch_propagate(
 
     with pytest.raises(upgrade.VersionMismatchError):
         main.main()
+
+
+def test_main_upgrade_flag_passes_retention_days_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_upgrade(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(main.upgrade, "run_upgrade", fake_run_upgrade)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", "0")
+
+    assert main.main() == 0
+    assert captured["old_datadir_retention_days"] == 0
+
+
+def test_main_upgrade_flag_defaults_retention_days_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_upgrade(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(main.upgrade, "run_upgrade", fake_run_upgrade)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.delenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", raising=False)
+
+    assert main.main() == 0
+    assert captured["old_datadir_retention_days"] is None
+
+
+# -- --upgrade-cleanup CLI dispatch (docs/decisions/0011) --
+
+
+def test_main_upgrade_cleanup_flag_dispatches_with_expected_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_cleanup(state_file: str, retention_days: int | None) -> bool:
+        captured["state_file"] = state_file
+        captured["retention_days"] = retention_days
+        return True
+
+    monkeypatch.setattr(main.upgrade, "cleanup_old_datadir_if_due", fake_cleanup)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade-cleanup"])
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE", "/var/lib/x/completed.json")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", "30")
+
+    assert main.main() == 0
+    assert captured == {"state_file": "/var/lib/x/completed.json", "retention_days": 30}
+
+
+def test_main_upgrade_cleanup_flag_returns_0_whether_or_not_anything_was_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main.upgrade, "cleanup_old_datadir_if_due", lambda *a, **k: False)
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade-cleanup"])
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE", "/var/lib/x/completed.json")
+    monkeypatch.delenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", raising=False)
+
+    assert main.main() == 0

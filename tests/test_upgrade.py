@@ -755,3 +755,152 @@ def test_run_upgrade_records_completion_against_the_old_datadir(
         completion_state_file=completion_state_file,
     )
     assert recorded == {"state_file": completion_state_file, "old_datadir": str(old_datadir)}
+
+
+# -- cleanup_old_datadir_if_due(): the separate timer-driven cleanup
+# (docs/decisions/0011) -- real filesystem state throughout, no mocking
+# needed since shutil.rmtree against a real tmp_path directory is cheap
+# and exercises the actual removal path directly.
+
+
+def test_cleanup_old_datadir_if_due_is_a_noop_when_nothing_recorded(tmp_path: Path) -> None:
+    result = upgrade.cleanup_old_datadir_if_due(str(tmp_path / "nope.json"), 10)
+    assert result is False
+
+
+def test_cleanup_old_datadir_if_due_is_a_noop_before_the_window_elapses(tmp_path: Path) -> None:
+    old_datadir = tmp_path / "old"
+    old_datadir.mkdir()
+    state_file = str(tmp_path / "completed.json")
+    completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    upgrade.record_upgrade_completion(state_file, str(old_datadir), now=completed_at)
+
+    result = upgrade.cleanup_old_datadir_if_due(
+        state_file, 10, now=completed_at + timedelta(days=5)
+    )
+    assert result is False
+    assert old_datadir.exists()
+
+
+def test_cleanup_old_datadir_if_due_removes_the_directory_once_due(tmp_path: Path) -> None:
+    old_datadir = tmp_path / "old"
+    old_datadir.mkdir()
+    (old_datadir / "PG_VERSION").write_text("15\n")
+    state_file = str(tmp_path / "completed.json")
+    completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    upgrade.record_upgrade_completion(state_file, str(old_datadir), now=completed_at)
+
+    result = upgrade.cleanup_old_datadir_if_due(
+        state_file, 10, now=completed_at + timedelta(days=10)
+    )
+    assert result is True
+    assert not old_datadir.exists()
+
+
+def test_cleanup_old_datadir_if_due_is_a_noop_when_retention_is_none(tmp_path: Path) -> None:
+    old_datadir = tmp_path / "old"
+    old_datadir.mkdir()
+    state_file = str(tmp_path / "completed.json")
+    upgrade.record_upgrade_completion(state_file, str(old_datadir))
+
+    result = upgrade.cleanup_old_datadir_if_due(state_file, None)
+    assert result is False
+    assert old_datadir.exists()
+
+
+def test_cleanup_old_datadir_if_due_handles_an_already_removed_directory_gracefully(
+    tmp_path: Path,
+) -> None:
+    """A second timer tick after the directory was already removed by
+    the first one must not raise -- rmtree's own FileNotFoundError is
+    exactly the expected steady state here, not an error."""
+    old_datadir = tmp_path / "old"  # deliberately never created
+    state_file = str(tmp_path / "completed.json")
+    completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    upgrade.record_upgrade_completion(state_file, str(old_datadir), now=completed_at)
+
+    result = upgrade.cleanup_old_datadir_if_due(
+        state_file, 0, now=completed_at
+    )
+    assert result is False
+
+
+# -- run_upgrade()'s own retention_days=0 "delete immediately" behavior
+# (docs/decisions/0011) -- the only case handled inline, same run, rather
+# than deferred to the separate cleanup timer above.
+
+
+def test_run_upgrade_removes_old_datadir_immediately_when_retention_is_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+
+    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
+
+    upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+        old_datadir_retention_days=0,
+    )
+    assert not old_datadir.exists()
+
+
+def test_run_upgrade_keeps_old_datadir_when_retention_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+
+    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
+
+    upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+    )
+    assert old_datadir.exists()
+
+
+def test_run_upgrade_keeps_old_datadir_when_retention_is_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A positive window is the separate timer's job to enforce, once
+    calendar time actually elapses -- not this same run."""
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+
+    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
+
+    upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "completed.json"),
+        old_datadir_retention_days=30,
+    )
+    assert old_datadir.exists()

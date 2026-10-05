@@ -389,6 +389,7 @@ def run_upgrade(
     jobs: int | None = None,
     initdb_args: list[str] | None = None,
     completion_state_file: str,
+    old_datadir_retention_days: int | None = None,
 ) -> bool:
     """Top-level entry point for the postgresql-collation-guard-upgrade
     unit (ordered Before=["postgresql.service"] -- see
@@ -413,6 +414,14 @@ def run_upgrade(
     -- an old cluster that's secretly the wrong version must be caught
     immediately, before anything downstream (even the no-op path) ever
     assumes old_schema is trustworthy.
+
+    old_datadir_retention_days=0 ("delete immediately", docs/decisions/
+    0011) is handled inline, in this same run, right here -- not
+    deferred to the separate cleanup timer cleanup_old_datadir_if_due()
+    exists for (see that function's own docstring for why a *positive*
+    window can't be handled this way). A failure removing it is logged
+    and swallowed, not allowed to turn an otherwise fully successful
+    upgrade into a failed run over what's now just disk-space cleanup.
     """
     if read_pg_version(new_datadir) is not None:
         return False
@@ -442,5 +451,38 @@ def run_upgrade(
         jobs=jobs,
     )
     record_upgrade_completion(completion_state_file, old_datadir)
+
+    if old_datadir_retention_days == 0:
+        shutil.rmtree(old_datadir, ignore_errors=True)
+
+    return True
+
+
+def cleanup_old_datadir_if_due(
+    completion_state_file: str, retention_days: int | None, *, now: datetime | None = None
+) -> bool:
+    """The separate timer's own job (docs/decisions/0011): removes the
+    retained old data directory once oldDataDirRetentionDays's window
+    has elapsed. Can't be folded into run_upgrade() above for a
+    *positive* window -- that function only ever runs once, at upgrade
+    time, while a positive retention window is defined entirely in
+    terms of calendar time elapsing *afterward*, independent of any
+    particular boot. (retention_days=0 bypasses this function entirely
+    -- see run_upgrade()'s own inline handling for that case.)
+
+    Returns True iff the directory was actually removed this call;
+    False for every no-op case: nothing recorded yet, not due yet, or
+    already removed by an earlier call of this same timer (rmtree's own
+    FileNotFoundError here is the expected steady state afterward, not
+    an error)."""
+    completion = read_upgrade_completion(completion_state_file)
+    if completion is None:
+        return False
+    if not old_datadir_due_for_cleanup(completion.completed_at, retention_days, now=now):
+        return False
+    try:
+        shutil.rmtree(completion.old_datadir)
+    except FileNotFoundError:
+        return False
     return True
 

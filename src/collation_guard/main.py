@@ -760,6 +760,7 @@ def run_upgrade_entrypoint(
     transfer_mode: str = "auto",
     jobs: int | None = None,
     initdb_args: list[str] | None = None,
+    old_datadir_retention_days: int | None = None,
 ) -> int:
     """Third entry point, invoked by the postgresql-collation-guard-
     upgrade.service unit -- ordered Before=["postgresql.service"]
@@ -786,11 +787,26 @@ def run_upgrade_entrypoint(
         jobs=jobs,
         initdb_args=initdb_args,
         completion_state_file=completion_state_file,
+        old_datadir_retention_days=old_datadir_retention_days,
     )
     if upgraded:
         logger.info("pg_upgrade completed: %s -> %s", old_datadir, new_datadir)
     else:
         logger.info("upgrade.enable is set but no upgrade was needed -- nothing to do")
+    return 0
+
+
+def run_upgrade_cleanup_entrypoint(completion_state_file: str, retention_days: int | None) -> int:
+    """Fourth entry point, invoked by the separate
+    postgresql-collation-guard-upgrade-cleanup.timer/.service pair
+    (docs/decisions/0011) -- independent of any particular boot, since
+    a positive oldDataDirRetentionDays window is defined in terms of
+    elapsed calendar time, not a repeat run of the upgrade unit itself.
+    Always returns 0: "not due yet" and "nothing was ever recorded" are
+    both ordinary, expected outcomes on most ticks, not failures."""
+    removed = upgrade.cleanup_old_datadir_if_due(completion_state_file, retention_days)
+    if removed:
+        logger.info("removed the retained old PostgreSQL data directory (retention window elapsed)")
     return 0
 
 
@@ -832,13 +848,29 @@ def main() -> int:
             "before postgresql.service starts -- not meant to be run directly"
         ),
     )
+    parser.add_argument(
+        "--upgrade-cleanup",
+        action="store_true",
+        help=(
+            "internal: invoked by the postgresql-collation-guard-upgrade-cleanup.timer's "
+            "own service -- not meant to be run directly"
+        ),
+    )
     args = parser.parse_args()
 
     hook_timeout_sec = float(os.environ.get("COLLATION_GUARD_HOOK_TIMEOUT_SEC", "90"))
 
+    if args.upgrade_cleanup:
+        retention_env = os.environ.get("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS")
+        return run_upgrade_cleanup_entrypoint(
+            completion_state_file=os.environ["COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"],
+            retention_days=int(retention_env) if retention_env else None,
+        )
+
     if args.upgrade:
         jobs_env = os.environ.get("COLLATION_GUARD_UPGRADE_JOBS")
         initdb_args_env = os.environ.get("COLLATION_GUARD_UPGRADE_INITDB_ARGS")
+        retention_env = os.environ.get("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS")
         return run_upgrade_entrypoint(
             old_bindir=os.environ["COLLATION_GUARD_UPGRADE_OLD_BINDIR"],
             new_bindir=os.environ["COLLATION_GUARD_UPGRADE_NEW_BINDIR"],
@@ -851,6 +883,7 @@ def main() -> int:
             transfer_mode=os.environ.get("COLLATION_GUARD_UPGRADE_TRANSFER_MODE", "auto"),
             jobs=int(jobs_env) if jobs_env else None,
             initdb_args=json.loads(initdb_args_env) if initdb_args_env else None,
+            old_datadir_retention_days=int(retention_env) if retention_env else None,
         )
 
     if args.on_failure:
