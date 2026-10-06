@@ -109,6 +109,17 @@
             nixosModule = self;
           }
         );
+
+        # Explicit "copy"/"link" transfer modes against a real
+        # pg_upgrade binary -- pgUpgradeTest above only exercises
+        # whatever "auto" resolves to.
+        pgUpgradeTransferModesTest = pkgs.testers.nixosTest (
+          import ./tests/nixos/pg-upgrade-transfer-modes.nix {
+            postgresqlOld = pkgs.postgresql_16;
+            postgresqlNew = pkgs.postgresql_17;
+            nixosModule = self;
+          }
+        );
       in
       {
         packages.default = collation-guard;
@@ -124,6 +135,7 @@
         #   nix build .#pgUpgradeTest -L
         packages.pgUpgradeTest = pgUpgradeTest;
         packages.pgUpgradeFailureTest = pgUpgradeFailureTest;
+        packages.pgUpgradeTransferModesTest = pgUpgradeTransferModesTest;
 
         checks = {
           unitTests = collation-guard;
