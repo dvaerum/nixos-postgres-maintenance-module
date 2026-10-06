@@ -848,6 +848,50 @@ def _write_context_file(path: str, report: RunReport) -> None:
         logger.warning("could not write context file %s", path, exc_info=True)
 
 
+def _required_env(name: str) -> str:
+    """A missing required environment variable is only ever reachable
+    by someone invoking collation-guard directly with a hand-edited
+    environment -- the NixOS module itself always sets every one of
+    these (see nixosModule/config.nix). Still worth a clear,
+    actionable message naming exactly which variable is missing,
+    rather than a bare KeyError traceback that doesn't say so."""
+    try:
+        return os.environ[name]
+    except KeyError:
+        raise SystemExit(
+            f"collation-guard: required environment variable {name} is not set"
+        ) from None
+
+
+def _int_env(name: str) -> int:
+    """Same reasoning as _required_env() -- a malformed value here is
+    only reachable via manual invocation, but the error should still
+    name the offending variable and its actual (invalid) value rather
+    than a bare ValueError."""
+    value = os.environ[name]
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(
+            f"collation-guard: environment variable {name}={value!r} is not a valid integer"
+        ) from None
+
+
+def _json_env(name: str) -> list[str]:
+    """Only ever used for COLLATION_GUARD_UPGRADE_INITDB_ARGS, always a
+    JSON array of strings (nixosModule/config.nix's own
+    builtins.toJSON cfg.upgrade.initdbArgs) -- typed for that one real
+    caller rather than the fully general `object` json.loads() itself
+    returns."""
+    value = os.environ[name]
+    try:
+        return json.loads(value)  # type: ignore[no-any-return]
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"collation-guard: environment variable {name}={value!r} is not valid JSON: {exc}"
+        ) from None
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="collation-guard: %(message)s")
 
@@ -889,25 +933,29 @@ def main() -> int:
     if args.upgrade_cleanup:
         retention_env = os.environ.get("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS")
         return run_upgrade_cleanup_entrypoint(
-            completion_state_file=os.environ["COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"],
-            retention_days=int(retention_env) if retention_env else None,
+            completion_state_file=_required_env("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"),
+            retention_days=_int_env("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS")
+            if retention_env
+            else None,
         )
 
     if args.upgrade:
-        jobs_env = os.environ.get("COLLATION_GUARD_UPGRADE_JOBS")
-        initdb_args_env = os.environ.get("COLLATION_GUARD_UPGRADE_INITDB_ARGS")
         return run_upgrade_entrypoint(
-            old_bindir=os.environ["COLLATION_GUARD_UPGRADE_OLD_BINDIR"],
-            new_bindir=os.environ["COLLATION_GUARD_UPGRADE_NEW_BINDIR"],
-            old_datadir=os.environ["COLLATION_GUARD_UPGRADE_OLD_DATADIR"],
-            new_datadir=os.environ["COLLATION_GUARD_UPGRADE_NEW_DATADIR"],
-            old_schema=os.environ["COLLATION_GUARD_UPGRADE_OLD_SCHEMA"],
-            new_schema=os.environ["COLLATION_GUARD_UPGRADE_NEW_SCHEMA"],
+            old_bindir=_required_env("COLLATION_GUARD_UPGRADE_OLD_BINDIR"),
+            new_bindir=_required_env("COLLATION_GUARD_UPGRADE_NEW_BINDIR"),
+            old_datadir=_required_env("COLLATION_GUARD_UPGRADE_OLD_DATADIR"),
+            new_datadir=_required_env("COLLATION_GUARD_UPGRADE_NEW_DATADIR"),
+            old_schema=_required_env("COLLATION_GUARD_UPGRADE_OLD_SCHEMA"),
+            new_schema=_required_env("COLLATION_GUARD_UPGRADE_NEW_SCHEMA"),
             superuser=os.environ.get("COLLATION_GUARD_UPGRADE_SUPERUSER", "postgres"),
-            completion_state_file=os.environ["COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"],
+            completion_state_file=_required_env("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"),
             transfer_mode=os.environ.get("COLLATION_GUARD_UPGRADE_TRANSFER_MODE", "auto"),
-            jobs=int(jobs_env) if jobs_env else None,
-            initdb_args=json.loads(initdb_args_env) if initdb_args_env else None,
+            jobs=_int_env("COLLATION_GUARD_UPGRADE_JOBS")
+            if os.environ.get("COLLATION_GUARD_UPGRADE_JOBS")
+            else None,
+            initdb_args=_json_env("COLLATION_GUARD_UPGRADE_INITDB_ARGS")
+            if os.environ.get("COLLATION_GUARD_UPGRADE_INITDB_ARGS")
+            else None,
         )
 
     if args.on_failure:

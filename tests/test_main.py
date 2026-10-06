@@ -2046,3 +2046,63 @@ def test_main_upgrade_cleanup_flag_returns_0_whether_or_not_anything_was_due(
     monkeypatch.delenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", raising=False)
 
     assert main.main() == 0
+
+
+# -- Clear error messages for malformed/missing CLI env vars (only
+# reachable via a manual/debug invocation with a hand-edited
+# environment -- the NixOS module itself always sets every required
+# variable correctly; see nixosModule/config.nix) --
+
+
+def test_main_upgrade_flag_missing_required_env_var_raises_a_clear_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.delenv("COLLATION_GUARD_UPGRADE_OLD_BINDIR", raising=False)
+
+    with pytest.raises(SystemExit, match="COLLATION_GUARD_UPGRADE_OLD_BINDIR"):
+        main.main()
+
+
+def test_main_upgrade_flag_malformed_jobs_raises_a_clear_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_JOBS", "not-a-number")
+
+    with pytest.raises(SystemExit, match="COLLATION_GUARD_UPGRADE_JOBS"):
+        main.main()
+
+
+def test_main_upgrade_flag_malformed_initdb_args_json_raises_a_clear_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
+    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_INITDB_ARGS", "{not valid json")
+
+    with pytest.raises(SystemExit, match="COLLATION_GUARD_UPGRADE_INITDB_ARGS"):
+        main.main()
+
+
+def test_main_upgrade_cleanup_flag_missing_required_env_var_raises_a_clear_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade-cleanup"])
+    monkeypatch.delenv("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE", raising=False)
+
+    with pytest.raises(SystemExit, match="COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"):
+        main.main()
+
+
+def test_main_upgrade_cleanup_flag_malformed_retention_days_raises_a_clear_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade-cleanup"])
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE", "/var/lib/x/completed.json")
+    monkeypatch.setenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", "not-a-number")
+
+    with pytest.raises(SystemExit, match="COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS"):
+        main.main()
