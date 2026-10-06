@@ -120,6 +120,18 @@
             nixosModule = self;
           }
         );
+
+        # An extension installed on the old cluster (the single
+        # most-cited real-world pg_upgrade failure mode) surviving a
+        # real migration, both its catalog entry and its actual
+        # runtime behavior.
+        pgUpgradeExtensionTest = pkgs.testers.nixosTest (
+          import ./tests/nixos/pg-upgrade-extension.nix {
+            postgresqlOld = pkgs.postgresql_16;
+            postgresqlNew = pkgs.postgresql_17;
+            nixosModule = self;
+          }
+        );
       in
       {
         packages.default = collation-guard;
@@ -136,6 +148,7 @@
         packages.pgUpgradeTest = pgUpgradeTest;
         packages.pgUpgradeFailureTest = pgUpgradeFailureTest;
         packages.pgUpgradeTransferModesTest = pgUpgradeTransferModesTest;
+        packages.pgUpgradeExtensionTest = pgUpgradeExtensionTest;
 
         checks = {
           unitTests = collation-guard;
