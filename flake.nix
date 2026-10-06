@@ -98,6 +98,17 @@
             nixosModule = self;
           }
         );
+
+        # A FAILED upgrade must block postgresql.service from starting
+        # at all -- the one thing pgUpgradeTest's happy path can never
+        # prove on its own.
+        pgUpgradeFailureTest = pkgs.testers.nixosTest (
+          import ./tests/nixos/pg-upgrade-failure.nix {
+            postgresqlOld = pkgs.postgresql_16;
+            postgresqlNew = pkgs.postgresql_17;
+            nixosModule = self;
+          }
+        );
       in
       {
         packages.default = collation-guard;
@@ -112,6 +123,7 @@
         # two-cluster migration, not a logic-level check) -- run by hand:
         #   nix build .#pgUpgradeTest -L
         packages.pgUpgradeTest = pgUpgradeTest;
+        packages.pgUpgradeFailureTest = pgUpgradeFailureTest;
 
         checks = {
           unitTests = collation-guard;
