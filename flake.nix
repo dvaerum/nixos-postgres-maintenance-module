@@ -165,6 +165,10 @@
         checks = {
           unitTests = collation-guard;
           validateHook = import ./tests/validate-hook.nix { inherit pkgs; };
+          optionValidation = import ./tests/option-validation.nix {
+            inherit pkgs;
+            nixosModule = self;
+          };
         }
         // nixosTests;
 
