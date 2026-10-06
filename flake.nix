@@ -132,6 +132,17 @@
             nixosModule = self;
           }
         );
+
+        # The positive-retention cleanup timer/service pair, against a
+        # real completed-upgrade state file (backdated to simulate the
+        # window elapsing, rather than waiting a literal day).
+        pgUpgradeRetentionTimerTest = pkgs.testers.nixosTest (
+          import ./tests/nixos/pg-upgrade-retention-timer.nix {
+            postgresqlOld = pkgs.postgresql_16;
+            postgresqlNew = pkgs.postgresql_17;
+            nixosModule = self;
+          }
+        );
       in
       {
         packages.default = collation-guard;
@@ -149,6 +160,7 @@
         packages.pgUpgradeFailureTest = pgUpgradeFailureTest;
         packages.pgUpgradeTransferModesTest = pgUpgradeTransferModesTest;
         packages.pgUpgradeExtensionTest = pgUpgradeExtensionTest;
+        packages.pgUpgradeRetentionTimerTest = pgUpgradeRetentionTimerTest;
 
         checks = {
           unitTests = collation-guard;
