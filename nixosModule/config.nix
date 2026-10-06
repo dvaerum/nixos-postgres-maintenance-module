@@ -103,274 +103,330 @@ let
   );
 in
 {
-  config = lib.mkIf cfg.enable {
-    # Static "postgres" is options.nix's own standalone default (safe
-    # for doc generation, which evaluates options.nix with no real
-    # services.postgresql present) -- this tracks the actually
-    # configured superuser once a real NixOS config is evaluated,
-    # while still losing to an explicit user override (mkDefault's
-    # lower precedence).
-    services.postgresqlCollationGuard.onFailureService.user = lib.mkDefault pgCfg.superUser;
-
-    systemd.tmpfiles.rules = [
-      # /run is tmpfs; systemd-tmpfiles-setup.service (which applies this)
-      # runs at early boot, well before postgresql-collation-guard.service
-      # -- the directory exists by the time the guard needs to write the
-      # context file, with no explicit ordering dependency required.
-      "d /run/postgresql-collation-guard 0750 ${pgCfg.superUser} postgres - -"
-      # /var/lib (persistent, unlike /run) for connectionLimitStateFile
-      # specifically -- see its own comment above for why. `d` only
-      # ensures the directory exists with these permissions; unlike
-      # `D`/`e` it never touches existing *contents*, so a state file
-      # already sitting there from before a reboot survives untouched.
-      "d /var/lib/postgresql-collation-guard 0750 ${pgCfg.superUser} postgres - -"
-    ];
-
-    # Surfaced on every `nixos-rebuild build`/`switch` (NixOS's own
-    # `warnings` mechanism, printed to stderr, same path as any other
-    # module's deprecation/compat warning) -- not just a doc nobody
-    # reads later. connectionLockdown is never silently *off* on an
-    # old PostgreSQL version (see lockdownMechanism above), but the
-    # fallback it falls back to is still weaker than the pg_hba
-    # mechanism in one documented way: CONNECTION LIMIT is not
-    # enforced against superuser connections
-    # (https://www.postgresql.org/docs/17/sql-createdatabase.html,
-    # CONNECTION LIMIT notes) -- see docs/decisions/0009. The operator
-    # should see that narrowing every time they build, not just
-    # discover it later by reading an ADR.
-    warnings = lib.optional (cfg.connectionLockdown.enable && !pgSupportsHbaIncludeIfExists) ''
-      services.postgresqlCollationGuard.connectionLockdown is using the
-      ALTER DATABASE ... CONNECTION LIMIT fallback mechanism, not the
-      pg_hba.conf mechanism: services.postgresql.package is PostgreSQL
-      ${pgCfg.package.version}, which predates PostgreSQL 16's
-      pg_hba.conf include_if_exists directive. This fallback does not
-      reject superuser connections (CONNECTION LIMIT is never enforced
-      against them, unlike a pg_hba.conf reject rule) -- a superuser
-      client can still connect to a database while it's actively being
-      reindexed/repaired. Upgrade services.postgresql.package to
-      postgresql_16 or newer to close this narrower gap. See
-      docs/decisions/0009-connection-limit-fallback-for-pg-lt-16.md.
-    '';
-
-    # include_if_exists is re-resolved on every pg_reload_conf(), unlike
-    # hba_file itself (fixed at server start, and NixOS points it at a
-    # read-only Nix store path) -- this is what lets LockdownManager
-    # reject/restore access at runtime with no restart. The file
-    # doesn't exist on a normal day, so this is a silent no-op unless
-    # something is actually locked. mkBefore so it's checked ahead of
-    # every other rule (first match wins in pg_hba.conf). Only added
-    # when the pg_hba mechanism is actually selected (PostgreSQL 16+)
-    # -- on an older server lockdownMechanism is "connection_limit"
-    # instead, which never touches pg_hba.conf at all (see
-    # docs/decisions/0009). See docs/decisions/0007.
-    services.postgresql.authentication = lib.mkIf (
-      cfg.connectionLockdown.enable && pgSupportsHbaIncludeIfExists
-    ) (lib.mkBefore "include_if_exists ${lockdownFile}");
-
-    systemd.services.postgresql-collation-guard = {
-      description = "Reindex/refresh any database whose collation library version changed, and repair drifted text-partition bounds";
-
-      requires = [ "postgresql.service" ];
-      after = [ "postgresql.service" ];
-      before = [ "postgresql-setup.service" ];
-
-      environment = {
-        PGHOST = "/run/postgresql"; # the postgresql module's own fixed default unix_socket_directories entry
-        PGPORT = toString pgCfg.settings.port;
-        GLIBC_LOCALES_PATH = "${config.i18n.glibcLocales}";
-        COLLATION_GUARD_PARTITION_REPAIR_ENABLE = lib.boolToString cfg.partitionRepair.enable;
-        COLLATION_GUARD_MAX_REPAIR_ATTEMPTS = toString cfg.partitionRepair.maxRepairAttempts;
-        COLLATION_GUARD_MAX_PARALLEL_DATABASES = toString cfg.maxParallelDatabases;
-        COLLATION_GUARD_CONTEXT_FILE = contextFile;
-        COLLATION_GUARD_HOOKS_FILE = "${hooksFile}";
-        COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
-        COLLATION_GUARD_CONNECTION_LOCKDOWN_ENABLE = lib.boolToString cfg.connectionLockdown.enable;
-        COLLATION_GUARD_LOCKDOWN_MECHANISM = lockdownMechanism;
-        COLLATION_GUARD_CONNECTION_LIMIT_STATE_FILE = connectionLimitStateFile;
-        COLLATION_GUARD_HOOK_TIMEOUT_SEC = toString cfg.hooks.timeoutSec;
-      };
-
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        User = pgCfg.superUser;
-        Group = "postgres";
-        # Cheap, zero-functional-cost hardening: nothing this unit does
-        # needs to gain privileges via exec (NoNewPrivileges) or share
-        # /tmp with other services (PrivateTmp). Broader directives
-        # (ProtectSystem, RestrictAddressFamilies) are deliberately NOT
-        # set here -- this unit needs real write access to the Postgres
-        # data directory, and hooks are user-configured executables
-        # that legitimately include network-calling notification hooks
-        # (see docs/decisions/0006) -- either would need case-by-case
-        # tuning (e.g. ReadWritePaths) to avoid breaking by default,
-        # not a blanket default. Override via `lib.mkForce` if either
-        # of these two ever conflicts with a specific deployment.
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        # preStart/onSuccess/postRun are invoked by the guard itself
-        # now, not via ExecStartPre/ExecStartPost/ExecStopPost -- see
-        # docs/decisions/0006 for why unifying them under one
-        # in-process mechanism (shared hook shape, shared
-        # environment-merge/collision rules) was worth losing
-        # systemd's free orchestration of them.
-        ExecStart = lib.getExe cfg.package;
-      };
+  # The assertions entry below is unconditional -- NOT inside the
+  # `lib.mkIf cfg.enable` branch, deliberately: that branch (and
+  # everything nested in it, including the upgrade unit itself) is
+  # entirely skipped when cfg.enable is false, so an assertion placed
+  # there would never fire for the exact misconfiguration it exists to
+  # catch -- upgrade.enable = true with the top-level enable left at
+  # its default false. Without this, that combination is a silent
+  # no-op: no unit, no warning, postgresql.service just starts the new
+  # binary directly against the old cluster's dataDir (which Postgres
+  # itself will likely refuse, but with no diagnostic pointing at the
+  # real cause). lib.mkMerge, not two separate top-level `config`
+  # attrs, since plain Nix attrset syntax can't define the same
+  # attribute (`config`) twice in one literal.
+  config = lib.mkMerge [
+    {
+      assertions = [
+        {
+          assertion = cfg.upgrade.enable -> cfg.enable;
+          message = ''
+            services.postgresqlCollationGuard.upgrade.enable is true, but
+            services.postgresqlCollationGuard.enable is false -- the
+            pg_upgrade orchestration unit is only ever defined when the
+            main collation guard itself is enabled (upgrade is a
+            sub-feature of this module, not a standalone one). Set
+            services.postgresqlCollationGuard.enable = true as well.
+          '';
+        }
+      ];
     }
-    // lib.optionalAttrs needsOnFailureUnit {
-      unitConfig.OnFailure = [ "postgresql-collation-guard-on-failure.service" ];
-    };
+    (lib.mkIf cfg.enable {
+      # Static "postgres" is options.nix's own standalone default (safe
+      # for doc generation, which evaluates options.nix with no real
+      # services.postgresql present) -- this tracks the actually
+      # configured superuser once a real NixOS config is evaluated,
+      # while still losing to an explicit user override (mkDefault's
+      # lower precedence).
+      services.postgresqlCollationGuard.onFailureService.user = lib.mkDefault pgCfg.superUser;
 
-    # Separate companion unit, triggered via the main unit's
-    # OnFailure= above -- this fires on ANY failure mode (non-zero
-    # exit, crash, kill, timeout), not just a clean non-zero exit a
-    # plain ExecStopPost could also observe, which is the one thing a
-    # plain post-run hook can't guarantee. Its ExecStart is a second,
-    # equally small entry point into the same binary (--on-failure):
-    # first an unconditional lockdown-file cleanup (independent of
-    # whether any onFailure hooks are configured at all -- see
-    # docs/decisions/0007), then the exact same run_hook()/
-    # merge_environment() code as every other stage for any configured
-    # onFailure hooks -- not a separate implementation.
-    systemd.services."postgresql-collation-guard-on-failure" = lib.mkIf needsOnFailureUnit {
-      description = "On-failure hooks for postgresql-collation-guard.service";
-      environment = {
-        COLLATION_GUARD_HOOKS_FILE = "${hooksFile}";
-        COLLATION_GUARD_CONTEXT_FILE = contextFile;
-        COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
-        COLLATION_GUARD_CONNECTION_LIMIT_STATE_FILE = connectionLimitStateFile;
-        PGHOST = "/run/postgresql";
-        PGPORT = toString pgCfg.settings.port;
-        COLLATION_GUARD_HOOK_TIMEOUT_SEC = toString cfg.hooks.timeoutSec;
-      };
-      serviceConfig = {
-        Type = "oneshot";
-        # Defaults to the same user/group as the main unit (see
-        # services.postgresqlCollationGuard.onFailureService's own
-        # description) -- this unit runs the identical hook mechanism,
-        # plus a lockdown-file cleanup that connects to Postgres as
-        # this user, so it must match rather than fall back to
-        # systemd's own root default.
-        User = cfg.onFailureService.user;
-        Group = cfg.onFailureService.group;
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ExecStart = "${lib.getExe cfg.package} --on-failure";
-      };
-    };
-
-    # postgresql-setup is defined upstream; these list options merge with
-    # its own definition rather than replacing it.
-    systemd.services.postgresql-setup = {
-      requires = [ "postgresql-collation-guard.service" ];
-      after = [ "postgresql-collation-guard.service" ];
-    };
-
-    # Same convention services.postgresql.dataDir itself uses -- see
-    # nixpkgs's own postgresql.nix. mkDefault here, not in options.nix:
-    # options.nix is evaluated standalone (with no real
-    # services.postgresql present) by generate-doc.nix, so any default
-    # that reads another option's value belongs in this file instead
-    # (same reason onFailureService.user's own real default is set here,
-    # not in options.nix).
-    services.postgresqlCollationGuard.upgrade.oldDataDir = lib.mkIf cfg.upgrade.enable (
-      lib.mkDefault "/var/lib/postgresql/${cfg.upgrade.oldPackage.psqlSchema}"
-    );
-
-    systemd.services.postgresql-collation-guard-upgrade = lib.mkIf cfg.upgrade.enable {
-      description = "Orchestrate a PostgreSQL major-version upgrade (pg_upgrade) before postgresql.service starts";
-
-      # Deliberately the OPPOSITE ordering from the main guard unit
-      # above: this must run strictly BEFORE either the old or new
-      # cluster's own postgres process ever starts (pg_upgrade manages
-      # both internally) -- not after, like the main guard (which needs
-      # a live connection, docs/decisions/0007). `before` here is just
-      # the ordering hint; what actually pulls this unit into the boot
-      # graph is systemd.services.postgresql's own requires/after below,
-      # the same two-sided pattern the main guard/postgresql-setup pair
-      # above already uses.
-      before = [ "postgresql.service" ];
-
-      unitConfig.RequiresMountsFor = [
-        cfg.upgrade.oldDataDir
-        pgCfg.dataDir
+      systemd.tmpfiles.rules = [
+        # /run is tmpfs; systemd-tmpfiles-setup.service (which applies this)
+        # runs at early boot, well before postgresql-collation-guard.service
+        # -- the directory exists by the time the guard needs to write the
+        # context file, with no explicit ordering dependency required.
+        "d /run/postgresql-collation-guard 0750 ${pgCfg.superUser} postgres - -"
+        # /var/lib (persistent, unlike /run) for connectionLimitStateFile
+        # specifically -- see its own comment above for why. `d` only
+        # ensures the directory exists with these permissions; unlike
+        # `D`/`e` it never touches existing *contents*, so a state file
+        # already sitting there from before a reboot survives untouched.
+        "d /var/lib/postgresql-collation-guard 0750 ${pgCfg.superUser} postgres - -"
       ];
 
-      environment = {
-        COLLATION_GUARD_UPGRADE_OLD_BINDIR = "${cfg.upgrade.oldPackage}/bin";
-        COLLATION_GUARD_UPGRADE_NEW_BINDIR = "${pgCfg.finalPackage}/bin";
-        COLLATION_GUARD_UPGRADE_OLD_DATADIR = cfg.upgrade.oldDataDir;
-        COLLATION_GUARD_UPGRADE_NEW_DATADIR = pgCfg.dataDir;
-        COLLATION_GUARD_UPGRADE_OLD_SCHEMA = cfg.upgrade.oldPackage.psqlSchema;
-        COLLATION_GUARD_UPGRADE_NEW_SCHEMA = pgCfg.package.psqlSchema;
-        COLLATION_GUARD_UPGRADE_SUPERUSER = pgCfg.superUser;
-        COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE = upgradeCompletionStateFile;
-        COLLATION_GUARD_UPGRADE_TRANSFER_MODE = cfg.upgrade.transferMode;
+      # Surfaced on every `nixos-rebuild build`/`switch` (NixOS's own
+      # `warnings` mechanism, printed to stderr, same path as any other
+      # module's deprecation/compat warning) -- not just a doc nobody
+      # reads later. connectionLockdown is never silently *off* on an
+      # old PostgreSQL version (see lockdownMechanism above), but the
+      # fallback it falls back to is still weaker than the pg_hba
+      # mechanism in one documented way: CONNECTION LIMIT is not
+      # enforced against superuser connections
+      # (https://www.postgresql.org/docs/17/sql-createdatabase.html,
+      # CONNECTION LIMIT notes) -- see docs/decisions/0009. The operator
+      # should see that narrowing every time they build, not just
+      # discover it later by reading an ADR.
+      warnings = lib.optional (cfg.connectionLockdown.enable && !pgSupportsHbaIncludeIfExists) ''
+        services.postgresqlCollationGuard.connectionLockdown is using the
+        ALTER DATABASE ... CONNECTION LIMIT fallback mechanism, not the
+        pg_hba.conf mechanism: services.postgresql.package is PostgreSQL
+        ${pgCfg.package.version}, which predates PostgreSQL 16's
+        pg_hba.conf include_if_exists directive. This fallback does not
+        reject superuser connections (CONNECTION LIMIT is never enforced
+        against them, unlike a pg_hba.conf reject rule) -- a superuser
+        client can still connect to a database while it's actively being
+        reindexed/repaired. Upgrade services.postgresql.package to
+        postgresql_16 or newer to close this narrower gap. See
+        docs/decisions/0009-connection-limit-fallback-for-pg-lt-16.md.
+      '';
+
+      # include_if_exists is re-resolved on every pg_reload_conf(), unlike
+      # hba_file itself (fixed at server start, and NixOS points it at a
+      # read-only Nix store path) -- this is what lets LockdownManager
+      # reject/restore access at runtime with no restart. The file
+      # doesn't exist on a normal day, so this is a silent no-op unless
+      # something is actually locked. mkBefore so it's checked ahead of
+      # every other rule (first match wins in pg_hba.conf). Only added
+      # when the pg_hba mechanism is actually selected (PostgreSQL 16+)
+      # -- on an older server lockdownMechanism is "connection_limit"
+      # instead, which never touches pg_hba.conf at all (see
+      # docs/decisions/0009). See docs/decisions/0007.
+      services.postgresql.authentication = lib.mkIf (
+        cfg.connectionLockdown.enable && pgSupportsHbaIncludeIfExists
+      ) (lib.mkBefore "include_if_exists ${lockdownFile}");
+
+      systemd.services.postgresql-collation-guard = {
+        description = "Reindex/refresh any database whose collation library version changed, and repair drifted text-partition bounds";
+
+        requires = [ "postgresql.service" ];
+        after = [ "postgresql.service" ];
+        before = [ "postgresql-setup.service" ];
+
+        environment = {
+          PGHOST = "/run/postgresql"; # the postgresql module's own fixed default unix_socket_directories entry
+          PGPORT = toString pgCfg.settings.port;
+          GLIBC_LOCALES_PATH = "${config.i18n.glibcLocales}";
+          COLLATION_GUARD_PARTITION_REPAIR_ENABLE = lib.boolToString cfg.partitionRepair.enable;
+          COLLATION_GUARD_MAX_REPAIR_ATTEMPTS = toString cfg.partitionRepair.maxRepairAttempts;
+          COLLATION_GUARD_MAX_PARALLEL_DATABASES = toString cfg.maxParallelDatabases;
+          COLLATION_GUARD_CONTEXT_FILE = contextFile;
+          COLLATION_GUARD_HOOKS_FILE = "${hooksFile}";
+          COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
+          COLLATION_GUARD_CONNECTION_LOCKDOWN_ENABLE = lib.boolToString cfg.connectionLockdown.enable;
+          COLLATION_GUARD_LOCKDOWN_MECHANISM = lockdownMechanism;
+          COLLATION_GUARD_CONNECTION_LIMIT_STATE_FILE = connectionLimitStateFile;
+          COLLATION_GUARD_HOOK_TIMEOUT_SEC = toString cfg.hooks.timeoutSec;
+        }
+        # Only set when upgrade.enable is true -- this is the real
+        # wiring for the retention_days=0 cleanup
+        # (cleanup_old_datadir_now_if_zero_retention(), docs/decisions/
+        # 0011): main.run() checks this env var right after its own
+        # first live connection to the cluster succeeds, proving the
+        # new cluster actually came up before ever deleting the old
+        # one. Without this, oldDataDirRetentionDays=0 would silently
+        # never clean anything up at all, with the Python side having
+        # no way to know a completion-state-file path even exists.
+        // lib.optionalAttrs cfg.upgrade.enable {
+          COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE = upgradeCompletionStateFile;
+        }
+        // lib.optionalAttrs (cfg.upgrade.enable && cfg.upgrade.oldDataDirRetentionDays != null) {
+          COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS = toString cfg.upgrade.oldDataDirRetentionDays;
+        };
+
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          User = pgCfg.superUser;
+          Group = "postgres";
+          # Cheap, zero-functional-cost hardening: nothing this unit does
+          # needs to gain privileges via exec (NoNewPrivileges) or share
+          # /tmp with other services (PrivateTmp). Broader directives
+          # (ProtectSystem, RestrictAddressFamilies) are deliberately NOT
+          # set here -- this unit needs real write access to the Postgres
+          # data directory, and hooks are user-configured executables
+          # that legitimately include network-calling notification hooks
+          # (see docs/decisions/0006) -- either would need case-by-case
+          # tuning (e.g. ReadWritePaths) to avoid breaking by default,
+          # not a blanket default. Override via `lib.mkForce` if either
+          # of these two ever conflicts with a specific deployment.
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          # preStart/onSuccess/postRun are invoked by the guard itself
+          # now, not via ExecStartPre/ExecStartPost/ExecStopPost -- see
+          # docs/decisions/0006 for why unifying them under one
+          # in-process mechanism (shared hook shape, shared
+          # environment-merge/collision rules) was worth losing
+          # systemd's free orchestration of them.
+          ExecStart = lib.getExe cfg.package;
+        };
       }
-      // lib.optionalAttrs (cfg.upgrade.jobs != null) {
-        COLLATION_GUARD_UPGRADE_JOBS = toString cfg.upgrade.jobs;
-      }
-      // lib.optionalAttrs (cfg.upgrade.initdbArgs != [ ]) {
-        COLLATION_GUARD_UPGRADE_INITDB_ARGS = builtins.toJSON cfg.upgrade.initdbArgs;
-      }
-      // lib.optionalAttrs (cfg.upgrade.oldDataDirRetentionDays != null) {
-        COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS = toString cfg.upgrade.oldDataDirRetentionDays;
+      // lib.optionalAttrs needsOnFailureUnit {
+        unitConfig.OnFailure = [ "postgresql-collation-guard-on-failure.service" ];
       };
 
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        User = pgCfg.superUser;
-        Group = "postgres";
-        # Same hardening rationale as the main unit above: nothing here
-        # needs privilege escalation or a shared /tmp, but ReadWritePaths
-        # tuning for the old/new data directories would need case-by-case
-        # care (their parent, /var/lib/postgresql, is itself the default
-        # StateDirectory owner for the NEW cluster -- see nixpkgs's own
-        # postgresql.nix), so no broader ProtectSystem/-Home default here
-        # either.
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ExecStart = "${lib.getExe cfg.package} --upgrade";
+      # Separate companion unit, triggered via the main unit's
+      # OnFailure= above -- this fires on ANY failure mode (non-zero
+      # exit, crash, kill, timeout), not just a clean non-zero exit a
+      # plain ExecStopPost could also observe, which is the one thing a
+      # plain post-run hook can't guarantee. Its ExecStart is a second,
+      # equally small entry point into the same binary (--on-failure):
+      # first an unconditional lockdown-file cleanup (independent of
+      # whether any onFailure hooks are configured at all -- see
+      # docs/decisions/0007), then the exact same run_hook()/
+      # merge_environment() code as every other stage for any configured
+      # onFailure hooks -- not a separate implementation.
+      systemd.services."postgresql-collation-guard-on-failure" = lib.mkIf needsOnFailureUnit {
+        description = "On-failure hooks for postgresql-collation-guard.service";
+        environment = {
+          COLLATION_GUARD_HOOKS_FILE = "${hooksFile}";
+          COLLATION_GUARD_CONTEXT_FILE = contextFile;
+          COLLATION_GUARD_LOCKDOWN_FILE = lockdownFile;
+          COLLATION_GUARD_CONNECTION_LIMIT_STATE_FILE = connectionLimitStateFile;
+          PGHOST = "/run/postgresql";
+          PGPORT = toString pgCfg.settings.port;
+          COLLATION_GUARD_HOOK_TIMEOUT_SEC = toString cfg.hooks.timeoutSec;
+        };
+        serviceConfig = {
+          Type = "oneshot";
+          # Defaults to the same user/group as the main unit (see
+          # services.postgresqlCollationGuard.onFailureService's own
+          # description) -- this unit runs the identical hook mechanism,
+          # plus a lockdown-file cleanup that connects to Postgres as
+          # this user, so it must match rather than fall back to
+          # systemd's own root default.
+          User = cfg.onFailureService.user;
+          Group = cfg.onFailureService.group;
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ExecStart = "${lib.getExe cfg.package} --on-failure";
+        };
       };
-    };
 
-    # Pulls postgresql-collation-guard-upgrade.service into the boot
-    # graph and orders postgresql.service after it -- the `before` set
-    # on the upgrade unit itself (above) is only an ordering hint and
-    # doesn't by itself cause anything to start it. Same two-sided
-    # pattern as postgresql-setup's own requires/after on the main guard
-    # unit. Requires= (not just After=) is deliberate: if the upgrade
-    # unit fails, postgresql.service must not start at all against a
-    # half-migrated data directory.
-    systemd.services.postgresql = lib.mkIf cfg.upgrade.enable {
-      requires = [ "postgresql-collation-guard-upgrade.service" ];
-      after = [ "postgresql-collation-guard-upgrade.service" ];
-    };
+      # postgresql-setup is defined upstream; these list options merge with
+      # its own definition rather than replacing it.
+      systemd.services.postgresql-setup = {
+        requires = [ "postgresql-collation-guard.service" ];
+        after = [ "postgresql-collation-guard.service" ];
+      };
 
-    systemd.timers.postgresql-collation-guard-upgrade-cleanup = lib.mkIf hasPositiveRetention {
-      description = "Check whether the retained old PostgreSQL data directory is due for cleanup";
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnBootSec = "15min";
-        OnUnitActiveSec = "1d";
-      };
-    };
+      # Same convention services.postgresql.dataDir itself uses -- see
+      # nixpkgs's own postgresql.nix. mkDefault here, not in options.nix:
+      # options.nix is evaluated standalone (with no real
+      # services.postgresql present) by generate-doc.nix, so any default
+      # that reads another option's value belongs in this file instead
+      # (same reason onFailureService.user's own real default is set here,
+      # not in options.nix).
+      services.postgresqlCollationGuard.upgrade.oldDataDir = lib.mkIf cfg.upgrade.enable (
+        lib.mkDefault "/var/lib/postgresql/${cfg.upgrade.oldPackage.psqlSchema}"
+      );
 
-    systemd.services.postgresql-collation-guard-upgrade-cleanup = lib.mkIf hasPositiveRetention {
-      description = "Remove the retained old PostgreSQL data directory once its retention window has elapsed";
-      environment = {
-        COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE = upgradeCompletionStateFile;
-        COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS = toString cfg.upgrade.oldDataDirRetentionDays;
+      systemd.services.postgresql-collation-guard-upgrade = lib.mkIf cfg.upgrade.enable {
+        description = "Orchestrate a PostgreSQL major-version upgrade (pg_upgrade) before postgresql.service starts";
+
+        # Deliberately the OPPOSITE ordering from the main guard unit
+        # above: this must run strictly BEFORE either the old or new
+        # cluster's own postgres process ever starts (pg_upgrade manages
+        # both internally) -- not after, like the main guard (which needs
+        # a live connection, docs/decisions/0007). `before` here is just
+        # the ordering hint; what actually pulls this unit into the boot
+        # graph is systemd.services.postgresql's own requires/after below,
+        # the same two-sided pattern the main guard/postgresql-setup pair
+        # above already uses.
+        before = [ "postgresql.service" ];
+
+        unitConfig.RequiresMountsFor = [
+          cfg.upgrade.oldDataDir
+          pgCfg.dataDir
+        ];
+
+        environment = {
+          COLLATION_GUARD_UPGRADE_OLD_BINDIR = "${cfg.upgrade.oldPackage}/bin";
+          COLLATION_GUARD_UPGRADE_NEW_BINDIR = "${pgCfg.finalPackage}/bin";
+          COLLATION_GUARD_UPGRADE_OLD_DATADIR = cfg.upgrade.oldDataDir;
+          COLLATION_GUARD_UPGRADE_NEW_DATADIR = pgCfg.dataDir;
+          COLLATION_GUARD_UPGRADE_OLD_SCHEMA = cfg.upgrade.oldPackage.psqlSchema;
+          COLLATION_GUARD_UPGRADE_NEW_SCHEMA = pgCfg.package.psqlSchema;
+          COLLATION_GUARD_UPGRADE_SUPERUSER = pgCfg.superUser;
+          COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE = upgradeCompletionStateFile;
+          COLLATION_GUARD_UPGRADE_TRANSFER_MODE = cfg.upgrade.transferMode;
+        }
+        // lib.optionalAttrs (cfg.upgrade.jobs != null) {
+          COLLATION_GUARD_UPGRADE_JOBS = toString cfg.upgrade.jobs;
+        }
+        // lib.optionalAttrs (cfg.upgrade.initdbArgs != [ ]) {
+          COLLATION_GUARD_UPGRADE_INITDB_ARGS = builtins.toJSON cfg.upgrade.initdbArgs;
+        }
+        // lib.optionalAttrs (cfg.upgrade.oldDataDirRetentionDays != null) {
+          COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS = toString cfg.upgrade.oldDataDirRetentionDays;
+        };
+
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          User = pgCfg.superUser;
+          Group = "postgres";
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          # Tighter than the main guard unit above: that unit can't use
+          # ProtectSystem/ReadWritePaths because user-configured hooks
+          # (docs/decisions/0006) legitimately need broader filesystem
+          # access this project can't predict in advance. This unit has
+          # no hooks at all -- it only ever touches the old/new data
+          # directories and its own completion-state file -- so scoping
+          # it tightly costs nothing. Doing something far more dangerous
+          # than the main guard (an irreversible binary migration, plus a
+          # conditional directory removal) is the reason this is worth
+          # doing here specifically, not just copying the main unit's
+          # lighter stance.
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          ReadWritePaths = lib.unique [
+            (builtins.dirOf cfg.upgrade.oldDataDir)
+            (builtins.dirOf pgCfg.dataDir)
+            (builtins.dirOf upgradeCompletionStateFile)
+          ];
+          ExecStart = "${lib.getExe cfg.package} --upgrade";
+        };
       };
-      serviceConfig = {
-        Type = "oneshot";
-        User = pgCfg.superUser;
-        Group = "postgres";
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ExecStart = "${lib.getExe cfg.package} --upgrade-cleanup";
+
+      # Pulls postgresql-collation-guard-upgrade.service into the boot
+      # graph and orders postgresql.service after it -- the `before` set
+      # on the upgrade unit itself (above) is only an ordering hint and
+      # doesn't by itself cause anything to start it. Same two-sided
+      # pattern as postgresql-setup's own requires/after on the main guard
+      # unit. Requires= (not just After=) is deliberate: if the upgrade
+      # unit fails, postgresql.service must not start at all against a
+      # half-migrated data directory.
+      systemd.services.postgresql = lib.mkIf cfg.upgrade.enable {
+        requires = [ "postgresql-collation-guard-upgrade.service" ];
+        after = [ "postgresql-collation-guard-upgrade.service" ];
       };
-    };
-  };
+
+      systemd.timers.postgresql-collation-guard-upgrade-cleanup = lib.mkIf hasPositiveRetention {
+        description = "Check whether the retained old PostgreSQL data directory is due for cleanup";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnBootSec = "15min";
+          OnUnitActiveSec = "1d";
+        };
+      };
+
+      systemd.services.postgresql-collation-guard-upgrade-cleanup = lib.mkIf hasPositiveRetention {
+        description = "Remove the retained old PostgreSQL data directory once its retention window has elapsed";
+        environment = {
+          COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE = upgradeCompletionStateFile;
+          COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS = toString cfg.upgrade.oldDataDirRetentionDays;
+        };
+        serviceConfig = {
+          Type = "oneshot";
+          User = pgCfg.superUser;
+          Group = "postgres";
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ExecStart = "${lib.getExe cfg.package} --upgrade-cleanup";
+        };
+      };
+    })
+  ];
 }
