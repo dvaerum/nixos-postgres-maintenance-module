@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -107,6 +108,68 @@ def test_run_is_a_clean_success_on_an_unremarkable_cluster(pg_dsn: str) -> None:
     assert report.success
     assert "postgres" in report.databases_processed
     assert report.failures == []
+
+
+def test_run_calls_upgrade_cleanup_after_a_successful_connection(
+    pg_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only reached once the first real connection to THIS cluster has
+    actually succeeded -- the verification oldDataDirRetentionDays=0's
+    "delete immediately" promise depends on (docs/decisions/0011's fix:
+    the original design deleted the old cluster inline inside
+    upgrade.run_upgrade(), which runs strictly BEFORE postgresql.service
+    ever starts and so could never prove the new cluster actually
+    comes up)."""
+    host, port = _host_port(pg_dsn)
+    state_file = str(tmp_path / "upgrade-attempt.json")
+
+    recorded: dict[str, object] = {}
+    monkeypatch.setattr(
+        main.upgrade,
+        "cleanup_old_datadir_now_if_zero_retention",
+        lambda state_file, retention_days: recorded.update(
+            state_file=state_file, retention_days=retention_days
+        ),
+    )
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+        upgrade_completion_state_file=state_file,
+        upgrade_old_datadir_retention_days=0,
+    )
+
+    assert report.success
+    assert recorded == {"state_file": state_file, "retention_days": 0}
+
+
+def test_run_does_not_call_upgrade_cleanup_when_not_configured(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The common case -- upgrade.enable was never turned on, so
+    upgrade_completion_state_file is None."""
+    host, port = _host_port(pg_dsn)
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        main.upgrade,
+        "cleanup_old_datadir_now_if_zero_retention",
+        lambda *a, **k: called.append("called"),
+    )
+
+    report = main.run(
+        host,
+        port,
+        glibc_locales_path="/nix/store/test-glibc-locales",
+        partition_repair_enabled=True,
+        max_repair_attempts=10,
+    )
+
+    assert report.success
+    assert called == []
 
 
 def test_run_is_idempotent_once_the_glibc_stamp_is_set(pg_dsn: str) -> None:
@@ -1895,40 +1958,61 @@ def test_main_upgrade_flag_lets_version_mismatch_propagate(
         main.main()
 
 
-def test_main_upgrade_flag_passes_retention_days_through(
+def test_main_passes_upgrade_completion_state_file_and_retention_env_vars_to_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The NORMAL (non-upgrade-flag) run() dispatch, not --upgrade --
+    cleanup_old_datadir_now_if_zero_retention() is called by run() itself,
+    after a verified live connection (docs/decisions/0011's fix for the
+    "deletes the old cluster before the new one ever starts" gap), not
+    by the one-shot --upgrade entry point."""
     captured: dict[str, object] = {}
 
-    def fake_run_upgrade(**kwargs: object) -> bool:
+    def fake_run(*args: object, **kwargs: object) -> main.RunReport:
         captured.update(kwargs)
-        return True
+        return main.RunReport()
 
-    monkeypatch.setattr(main.upgrade, "run_upgrade", fake_run_upgrade)
-    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
-    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.setattr(main, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["collation-guard"])
+    monkeypatch.setenv("PGHOST", "x")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("GLIBC_LOCALES_PATH", "/nix/store/x")
+    monkeypatch.setenv("COLLATION_GUARD_PARTITION_REPAIR_ENABLE", "true")
+    monkeypatch.setenv("COLLATION_GUARD_MAX_REPAIR_ATTEMPTS", "100")
+    monkeypatch.setenv(
+        "COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE", "/var/lib/x/upgrade-attempt.json"
+    )
     monkeypatch.setenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", "0")
 
     assert main.main() == 0
-    assert captured["old_datadir_retention_days"] == 0
+    assert captured["upgrade_completion_state_file"] == "/var/lib/x/upgrade-attempt.json"
+    assert captured["upgrade_old_datadir_retention_days"] == 0
 
 
-def test_main_upgrade_flag_defaults_retention_days_to_none(
+def test_main_defaults_upgrade_completion_state_file_and_retention_to_none_when_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The common case -- upgrade.enable was never turned on, so the
+    NixOS module never sets either env var at all."""
     captured: dict[str, object] = {}
 
-    def fake_run_upgrade(**kwargs: object) -> bool:
+    def fake_run(*args: object, **kwargs: object) -> main.RunReport:
         captured.update(kwargs)
-        return True
+        return main.RunReport()
 
-    monkeypatch.setattr(main.upgrade, "run_upgrade", fake_run_upgrade)
-    monkeypatch.setattr(sys, "argv", ["collation-guard", "--upgrade"])
-    _set_required_upgrade_env(monkeypatch)
+    monkeypatch.setattr(main, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["collation-guard"])
+    monkeypatch.setenv("PGHOST", "x")
+    monkeypatch.setenv("PGPORT", "5432")
+    monkeypatch.setenv("GLIBC_LOCALES_PATH", "/nix/store/x")
+    monkeypatch.setenv("COLLATION_GUARD_PARTITION_REPAIR_ENABLE", "true")
+    monkeypatch.setenv("COLLATION_GUARD_MAX_REPAIR_ATTEMPTS", "100")
+    monkeypatch.delenv("COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE", raising=False)
     monkeypatch.delenv("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS", raising=False)
 
     assert main.main() == 0
-    assert captured["old_datadir_retention_days"] is None
+    assert captured["upgrade_completion_state_file"] is None
+    assert captured["upgrade_old_datadir_retention_days"] is None
 
 
 # -- --upgrade-cleanup CLI dispatch (docs/decisions/0011) --

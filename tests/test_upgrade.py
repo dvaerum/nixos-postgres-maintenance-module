@@ -491,34 +491,61 @@ def test_run_pg_upgrade_raises_with_stderr_on_failure(monkeypatch: pytest.Monkey
         )
 
 
-# -- Upgrade-completion stamp + time-gated old-dataDir retention
-# (docs/decisions/0011) --
+# -- Upgrade-attempt tracking + time-gated old-dataDir retention
+# (docs/decisions/0010, 0011) -- one state file, written in two steps:
+# record_upgrade_attempt_started() before initdb ever touches
+# new_datadir, record_upgrade_attempt_completed() only once pg_upgrade
+# has actually succeeded. The gap between those two writes is exactly
+# what distinguishes "a previous attempt started but never finished"
+# from "genuinely done" -- see run_upgrade()'s own tests further down.
 
 
-def test_record_and_read_upgrade_completion_round_trips(tmp_path: Path) -> None:
-    state_file = str(tmp_path / "upgrade-completed.json")
-    completed_at = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
-    upgrade.record_upgrade_completion(state_file, "/old/data", now=completed_at)
+def test_record_attempt_started_then_read_round_trips(tmp_path: Path) -> None:
+    state_file = str(tmp_path / "upgrade-attempt.json")
+    started_at = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+    upgrade.record_upgrade_attempt_started(state_file, "/old/data", now=started_at)
 
-    result = upgrade.read_upgrade_completion(state_file)
+    result = upgrade.read_upgrade_attempt(state_file)
     assert result is not None
     assert result.old_datadir == "/old/data"
+    assert result.started_at == started_at
+    assert result.completed_at is None
+
+
+def test_record_attempt_completed_sets_completed_at_without_losing_old_datadir(
+    tmp_path: Path,
+) -> None:
+    state_file = str(tmp_path / "upgrade-attempt.json")
+    started_at = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+    completed_at = datetime(2026, 1, 15, 12, 5, 0, tzinfo=UTC)
+    upgrade.record_upgrade_attempt_started(state_file, "/old/data", now=started_at)
+    upgrade.record_upgrade_attempt_completed(state_file, now=completed_at)
+
+    result = upgrade.read_upgrade_attempt(state_file)
+    assert result is not None
+    assert result.old_datadir == "/old/data"
+    assert result.started_at == started_at
     assert result.completed_at == completed_at
 
 
-def test_read_upgrade_completion_returns_none_when_missing(tmp_path: Path) -> None:
-    assert upgrade.read_upgrade_completion(str(tmp_path / "nope.json")) is None
+def test_read_upgrade_attempt_returns_none_when_missing(tmp_path: Path) -> None:
+    assert upgrade.read_upgrade_attempt(str(tmp_path / "nope.json")) is None
 
 
-def test_record_upgrade_completion_writes_atomically(tmp_path: Path) -> None:
-    """Temp file + os.replace, same directory -- same pattern as
-    0009's connection-limit state file: a process killed mid-write must
-    never leave a corrupt file behind for a later cleanup timer to
-    choke on."""
-    state_file = str(tmp_path / "upgrade-completed.json")
-    upgrade.record_upgrade_completion(state_file, "/old/data")
-    # No leftover temp files in the directory once the write completes.
-    assert list(tmp_path.iterdir()) == [tmp_path / "upgrade-completed.json"]
+def test_record_upgrade_attempt_started_writes_atomically(tmp_path: Path) -> None:
+    """Temp file + os.replace, same directory -- same pattern as 0009's
+    connection-limit state file: a process killed mid-write must never
+    leave a corrupt file behind for a later read to choke on."""
+    state_file = str(tmp_path / "upgrade-attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, "/old/data")
+    assert list(tmp_path.iterdir()) == [tmp_path / "upgrade-attempt.json"]
+
+
+def test_record_upgrade_attempt_completed_also_writes_atomically(tmp_path: Path) -> None:
+    state_file = str(tmp_path / "upgrade-attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, "/old/data")
+    upgrade.record_upgrade_attempt_completed(state_file)
+    assert list(tmp_path.iterdir()) == [tmp_path / "upgrade-attempt.json"]
 
 
 def test_old_datadir_due_for_cleanup_never_when_retention_is_none() -> None:
@@ -547,9 +574,12 @@ def test_old_datadir_due_for_cleanup_once_the_window_elapses() -> None:
 # -- run_upgrade(): the top-level entry point the
 # postgresql-collation-guard-upgrade.service unit calls (docs/decisions/0011).
 # Real tmp_path filesystem state drives the (cheap) gating logic
-# (read_pg_version/validate_old_version); only the actually-external pieces
-# (resolve_transfer_mode's own preflight, initdb_new_cluster, run_pg_upgrade,
-# record_upgrade_completion) are mocked.
+# (read_pg_version/validate_old_version/read_upgrade_attempt); only the
+# actually-external pieces (resolve_transfer_mode's own preflight,
+# initdb_new_cluster, run_pg_upgrade) are mocked. retention/cleanup is no
+# longer run_upgrade()'s concern at all -- see
+# cleanup_old_datadir_now_if_zero_retention()'s own tests further down for
+# why that moved to main.run(), after a verified live connection.
 
 
 def _make_cluster(path: Path, schema: str) -> None:
@@ -562,12 +592,14 @@ def test_run_upgrade_is_a_noop_when_new_datadir_already_upgraded(
 ) -> None:
     """Idempotent by construction (docs/decisions/0011): upgrade.enable
     can stay true across any number of subsequent boots with no repeat
-    effect, since the only gate is whether new_datadir already has its
-    own PG_VERSION."""
+    effect, once a genuinely-completed attempt is on record."""
     old_datadir = tmp_path / "old"
     new_datadir = tmp_path / "new"
     _make_cluster(old_datadir, "15")
     _make_cluster(new_datadir, "16")
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    upgrade.record_upgrade_attempt_completed(state_file)
 
     called: list[str] = []
     monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: called.append("initdb"))
@@ -581,10 +613,133 @@ def test_run_upgrade_is_a_noop_when_new_datadir_already_upgraded(
         old_schema="15",
         new_schema="16",
         superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
+        completion_state_file=state_file,
     )
     assert result is False
     assert called == []
+
+
+def test_run_upgrade_is_a_noop_when_new_datadir_predates_any_upgrade_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """new_datadir can have a PG_VERSION with NO attempt record at all --
+    e.g. upgrade.enable was turned on after the new version was already
+    running normally, independent of this feature entirely. Nothing to
+    upgrade; must stay a safe no-op, not an error (see gap: this is
+    deliberately distinct from test_run_upgrade_raises_when_new_datadir_
+    exists_from_an_incomplete_attempt below, which DOES raise)."""
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+    _make_cluster(new_datadir, "16")
+    # No attempt.json at all -- new_datadir's PG_VERSION came from
+    # somewhere entirely unrelated to this feature.
+
+    called: list[str] = []
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: called.append("initdb"))
+
+    result = upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=str(tmp_path / "attempt.json"),
+    )
+    assert result is False
+    assert called == []
+
+
+def test_run_upgrade_raises_when_new_datadir_exists_from_an_incomplete_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE critical-severity gap this closes: a previous attempt ran
+    initdb_new_cluster() (which writes new_datadir/PG_VERSION) and then
+    run_pg_upgrade() failed -- new_datadir now has a PG_VERSION, but no
+    completed_at was ever recorded. Before this fix, the NEXT run_upgrade()
+    call would see "new_datadir has PG_VERSION" and silently return False,
+    permanently treating a failed migration as a successful one --
+    postgresql.service would then start cleanly against an empty/partial
+    new cluster with zero signal anything was ever wrong. Must now raise
+    loudly instead, every single time, until an operator intervenes."""
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+    _make_cluster(new_datadir, "16")  # as if initdb_new_cluster() already ran
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    # Deliberately NOT completed -- this is the failed-midway state.
+
+    called: list[str] = []
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: called.append("initdb"))
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda *a, **k: called.append("pg_upgrade"))
+
+    with pytest.raises(upgrade.IncompleteUpgradeError, match=str(new_datadir)):
+        upgrade.run_upgrade(
+            old_bindir="/old/bin",
+            new_bindir="/new/bin",
+            old_datadir=str(old_datadir),
+            new_datadir=str(new_datadir),
+            old_schema="15",
+            new_schema="16",
+            superuser="postgres",
+            completion_state_file=state_file,
+        )
+    # Must raise on EVERY call, not retry automatically -- pg_upgrade
+    # itself requires a truly fresh target, not a half-touched one.
+    assert called == []
+
+
+def test_run_upgrade_incomplete_attempt_error_keeps_raising_on_repeated_calls(
+    tmp_path: Path,
+) -> None:
+    """Not a one-shot raise-then-clear -- every subsequent invocation
+    must keep raising until an operator manually removes new_datadir,
+    confirming this can never silently resolve itself."""
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+    _make_cluster(new_datadir, "16")
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+
+    for _ in range(3):
+        with pytest.raises(upgrade.IncompleteUpgradeError):
+            upgrade.run_upgrade(
+                old_bindir="/old/bin",
+                new_bindir="/new/bin",
+                old_datadir=str(old_datadir),
+                new_datadir=str(new_datadir),
+                old_schema="15",
+                new_schema="16",
+                superuser="postgres",
+                completion_state_file=state_file,
+            )
+
+
+def test_run_upgrade_raises_when_old_and_new_datadir_are_identical(tmp_path: Path) -> None:
+    """A real misconfiguration (oldDataDir and the configured
+    services.postgresql.dataDir resolving to the same path) must be
+    caught explicitly and FIRST -- before this fix, the identical path
+    meant new_datadir's own PG_VERSION (really the old cluster's) was
+    silently treated as "already upgraded", absorbing the
+    misconfiguration into a no-op with zero diagnostic."""
+    same_dir = tmp_path / "same"
+    _make_cluster(same_dir, "15")
+
+    with pytest.raises(upgrade.IdenticalDataDirectoriesError, match=str(same_dir)):
+        upgrade.run_upgrade(
+            old_bindir="/old/bin",
+            new_bindir="/new/bin",
+            old_datadir=str(same_dir),
+            new_datadir=str(same_dir),
+            old_schema="15",
+            new_schema="16",
+            superuser="postgres",
+            completion_state_file=str(tmp_path / "attempt.json"),
+        )
 
 
 def test_run_upgrade_is_a_noop_when_there_is_no_old_cluster_yet(tmp_path: Path) -> None:
@@ -602,7 +757,7 @@ def test_run_upgrade_is_a_noop_when_there_is_no_old_cluster_yet(tmp_path: Path) 
         old_schema="15",
         new_schema="16",
         superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
+        completion_state_file=str(tmp_path / "attempt.json"),
     )
     assert result is False
 
@@ -620,7 +775,7 @@ def test_run_upgrade_raises_on_old_version_mismatch(tmp_path: Path) -> None:
             old_schema="15",
             new_schema="16",
             superuser="postgres",
-            completion_state_file=str(tmp_path / "completed.json"),
+            completion_state_file=str(tmp_path / "attempt.json"),
         )
 
 
@@ -642,7 +797,7 @@ def test_run_upgrade_is_a_noop_when_old_and_new_schema_match(
         old_schema="16",
         new_schema="16",
         superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
+        completion_state_file=str(tmp_path / "attempt.json"),
     )
     assert result is False
     assert called == []
@@ -657,23 +812,17 @@ def test_run_upgrade_happy_path_calls_everything_in_order(
 
     call_order: list[str] = []
 
-    def fake_resolve(
-        requested: str, *, old_datadir: str, new_datadir_parent: str
-    ) -> str:
+    def fake_resolve(requested: str, *, old_datadir: str, new_datadir_parent: str) -> str:
         call_order.append("resolve")
         return "clone"
 
     monkeypatch.setattr(upgrade, "resolve_transfer_mode", fake_resolve)
-    monkeypatch.setattr(
-        upgrade, "initdb_new_cluster", lambda *a, **k: call_order.append("initdb")
-    )
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: call_order.append("initdb"))
     monkeypatch.setattr(
         upgrade, "run_pg_upgrade", lambda *a, **k: call_order.append("pg_upgrade")
     )
-    monkeypatch.setattr(
-        upgrade, "record_upgrade_completion", lambda *a, **k: call_order.append("record")
-    )
 
+    state_file = str(tmp_path / "attempt.json")
     result = upgrade.run_upgrade(
         old_bindir="/old/bin",
         new_bindir="/new/bin",
@@ -682,10 +831,57 @@ def test_run_upgrade_happy_path_calls_everything_in_order(
         old_schema="15",
         new_schema="16",
         superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
+        completion_state_file=state_file,
     )
     assert result is True
-    assert call_order == ["resolve", "initdb", "pg_upgrade", "record"]
+    assert call_order == ["resolve", "initdb", "pg_upgrade"]
+
+    # The attempt was recorded both as started (before initdb) and
+    # completed (after pg_upgrade) -- not just a bare "it worked" bool.
+    attempt = upgrade.read_upgrade_attempt(state_file)
+    assert attempt is not None
+    assert attempt.old_datadir == str(old_datadir)
+    assert attempt.completed_at is not None
+
+
+def test_run_upgrade_records_attempt_started_before_initdb_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If initdb itself crashes the whole process (not just raises a
+    caught exception -- e.g. OOM-killed), the started record must
+    already be on disk, or a retry could never distinguish this from
+    "nothing was ever attempted" and skip the IncompleteUpgradeError
+    guard entirely."""
+    old_datadir = tmp_path / "old"
+    new_datadir = tmp_path / "new"
+    _make_cluster(old_datadir, "15")
+    state_file = str(tmp_path / "attempt.json")
+
+    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
+
+    def fake_initdb(*a: object, **k: object) -> None:
+        # At the moment initdb is invoked, the attempt must already be
+        # on disk as "started".
+        attempt = upgrade.read_upgrade_attempt(state_file)
+        assert attempt is not None
+        assert attempt.completed_at is None
+        # Mirror the real initdb_new_cluster() side effect so the
+        # idempotency gate behaves realistically for this test.
+        _make_cluster(new_datadir, "16")
+
+    monkeypatch.setattr(upgrade, "initdb_new_cluster", fake_initdb)
+    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda *a, **k: None)
+
+    upgrade.run_upgrade(
+        old_bindir="/old/bin",
+        new_bindir="/new/bin",
+        old_datadir=str(old_datadir),
+        new_datadir=str(new_datadir),
+        old_schema="15",
+        new_schema="16",
+        superuser="postgres",
+        completion_state_file=state_file,
+    )
 
 
 def test_run_upgrade_passes_resolved_mode_jobs_and_initdb_args_through(
@@ -696,7 +892,6 @@ def test_run_upgrade_passes_resolved_mode_jobs_and_initdb_args_through(
     _make_cluster(old_datadir, "15")
 
     monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "link")
-    monkeypatch.setattr(upgrade, "record_upgrade_completion", lambda *a, **k: None)
 
     initdb_recorded: dict[str, object] = {}
     pg_upgrade_recorded: dict[str, object] = {}
@@ -713,7 +908,7 @@ def test_run_upgrade_passes_resolved_mode_jobs_and_initdb_args_through(
         old_schema="15",
         new_schema="16",
         superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
+        completion_state_file=str(tmp_path / "attempt.json"),
         transfer_mode="link",
         jobs=4,
         initdb_args=["--data-checksums"],
@@ -721,40 +916,6 @@ def test_run_upgrade_passes_resolved_mode_jobs_and_initdb_args_through(
     assert pg_upgrade_recorded["transfer_mode"] == "link"
     assert pg_upgrade_recorded["jobs"] == 4
     assert initdb_recorded["kwargs"]["initdb_args"] == ["--data-checksums"]
-
-
-def test_run_upgrade_records_completion_against_the_old_datadir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    old_datadir = tmp_path / "old"
-    new_datadir = tmp_path / "new"
-    _make_cluster(old_datadir, "15")
-
-    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
-    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
-    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
-
-    recorded: dict[str, object] = {}
-    monkeypatch.setattr(
-        upgrade,
-        "record_upgrade_completion",
-        lambda state_file, old_dir, **k: recorded.update(
-            state_file=state_file, old_datadir=old_dir
-        ),
-    )
-
-    completion_state_file = str(tmp_path / "completed.json")
-    upgrade.run_upgrade(
-        old_bindir="/old/bin",
-        new_bindir="/new/bin",
-        old_datadir=str(old_datadir),
-        new_datadir=str(new_datadir),
-        old_schema="15",
-        new_schema="16",
-        superuser="postgres",
-        completion_state_file=completion_state_file,
-    )
-    assert recorded == {"state_file": completion_state_file, "old_datadir": str(old_datadir)}
 
 
 # -- cleanup_old_datadir_if_due(): the separate timer-driven cleanup
@@ -771,9 +932,10 @@ def test_cleanup_old_datadir_if_due_is_a_noop_when_nothing_recorded(tmp_path: Pa
 def test_cleanup_old_datadir_if_due_is_a_noop_before_the_window_elapses(tmp_path: Path) -> None:
     old_datadir = tmp_path / "old"
     old_datadir.mkdir()
-    state_file = str(tmp_path / "completed.json")
+    state_file = str(tmp_path / "attempt.json")
     completed_at = datetime(2026, 1, 1, tzinfo=UTC)
-    upgrade.record_upgrade_completion(state_file, str(old_datadir), now=completed_at)
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir), now=completed_at)
+    upgrade.record_upgrade_attempt_completed(state_file, now=completed_at)
 
     result = upgrade.cleanup_old_datadir_if_due(
         state_file, 10, now=completed_at + timedelta(days=5)
@@ -786,9 +948,10 @@ def test_cleanup_old_datadir_if_due_removes_the_directory_once_due(tmp_path: Pat
     old_datadir = tmp_path / "old"
     old_datadir.mkdir()
     (old_datadir / "PG_VERSION").write_text("15\n")
-    state_file = str(tmp_path / "completed.json")
+    state_file = str(tmp_path / "attempt.json")
     completed_at = datetime(2026, 1, 1, tzinfo=UTC)
-    upgrade.record_upgrade_completion(state_file, str(old_datadir), now=completed_at)
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir), now=completed_at)
+    upgrade.record_upgrade_attempt_completed(state_file, now=completed_at)
 
     result = upgrade.cleanup_old_datadir_if_due(
         state_file, 10, now=completed_at + timedelta(days=10)
@@ -800,10 +963,30 @@ def test_cleanup_old_datadir_if_due_removes_the_directory_once_due(tmp_path: Pat
 def test_cleanup_old_datadir_if_due_is_a_noop_when_retention_is_none(tmp_path: Path) -> None:
     old_datadir = tmp_path / "old"
     old_datadir.mkdir()
-    state_file = str(tmp_path / "completed.json")
-    upgrade.record_upgrade_completion(state_file, str(old_datadir))
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    upgrade.record_upgrade_attempt_completed(state_file)
 
     result = upgrade.cleanup_old_datadir_if_due(state_file, None)
+    assert result is False
+    assert old_datadir.exists()
+
+
+def test_cleanup_old_datadir_if_due_is_a_noop_for_an_incomplete_attempt(tmp_path: Path) -> None:
+    """A failed/incomplete upgrade's old_datadir must NEVER be cleaned
+    up by the timer, regardless of retention_days or how much calendar
+    time has passed -- it's the only copy of the real data left, and
+    IncompleteUpgradeError (see run_upgrade()'s own tests) is what's
+    supposed to force manual intervention, not an unattended rm -rf."""
+    old_datadir = tmp_path / "old"
+    old_datadir.mkdir()
+    state_file = str(tmp_path / "attempt.json")
+    started_at = datetime(2020, 1, 1, tzinfo=UTC)
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir), now=started_at)
+    # Deliberately never completed.
+
+    far_future = datetime(2030, 1, 1, tzinfo=UTC)
+    result = upgrade.cleanup_old_datadir_if_due(state_file, 0, now=far_future)
     assert result is False
     assert old_datadir.exists()
 
@@ -815,92 +998,103 @@ def test_cleanup_old_datadir_if_due_handles_an_already_removed_directory_gracefu
     the first one must not raise -- rmtree's own FileNotFoundError is
     exactly the expected steady state here, not an error."""
     old_datadir = tmp_path / "old"  # deliberately never created
-    state_file = str(tmp_path / "completed.json")
+    state_file = str(tmp_path / "attempt.json")
     completed_at = datetime(2026, 1, 1, tzinfo=UTC)
-    upgrade.record_upgrade_completion(state_file, str(old_datadir), now=completed_at)
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir), now=completed_at)
+    upgrade.record_upgrade_attempt_completed(state_file, now=completed_at)
 
-    result = upgrade.cleanup_old_datadir_if_due(
-        state_file, 0, now=completed_at
-    )
+    result = upgrade.cleanup_old_datadir_if_due(state_file, 0, now=completed_at)
     assert result is False
 
 
-# -- run_upgrade()'s own retention_days=0 "delete immediately" behavior
-# (docs/decisions/0011) -- the only case handled inline, same run, rather
-# than deferred to the separate cleanup timer above.
+# -- cleanup_old_datadir_now_if_zero_retention(): the retention_days=0
+# ("delete immediately") case (docs/decisions/0011) -- called by
+# main.run(), AFTER it has already proven the new cluster is up and
+# reachable (a live connection succeeded), not inline inside
+# run_upgrade() itself (which runs strictly before postgresql.service
+# ever starts -- deleting the only remaining copy of the real data
+# before the new cluster has been proven to even start is the gap this
+# closes; see docs/decisions/0011's "A positive-retention cleanup..."
+# section).
 
 
-def test_run_upgrade_removes_old_datadir_immediately_when_retention_is_zero(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cleanup_now_if_zero_retention_removes_the_directory(tmp_path: Path) -> None:
     old_datadir = tmp_path / "old"
-    new_datadir = tmp_path / "new"
-    _make_cluster(old_datadir, "15")
+    old_datadir.mkdir()
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    upgrade.record_upgrade_attempt_completed(state_file)
 
-    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
-    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
-    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
-
-    upgrade.run_upgrade(
-        old_bindir="/old/bin",
-        new_bindir="/new/bin",
-        old_datadir=str(old_datadir),
-        new_datadir=str(new_datadir),
-        old_schema="15",
-        new_schema="16",
-        superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
-        old_datadir_retention_days=0,
-    )
+    result = upgrade.cleanup_old_datadir_now_if_zero_retention(state_file, 0)
+    assert result is True
     assert not old_datadir.exists()
 
 
-def test_run_upgrade_keeps_old_datadir_when_retention_is_none(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_cleanup_now_if_zero_retention_is_a_noop_for_any_other_retention_value(
+    tmp_path: Path,
 ) -> None:
     old_datadir = tmp_path / "old"
-    new_datadir = tmp_path / "new"
-    _make_cluster(old_datadir, "15")
+    old_datadir.mkdir()
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    upgrade.record_upgrade_attempt_completed(state_file)
 
-    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
-    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
-    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
-
-    upgrade.run_upgrade(
-        old_bindir="/old/bin",
-        new_bindir="/new/bin",
-        old_datadir=str(old_datadir),
-        new_datadir=str(new_datadir),
-        old_schema="15",
-        new_schema="16",
-        superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
-    )
+    for retention in (None, 1, 30):
+        assert upgrade.cleanup_old_datadir_now_if_zero_retention(state_file, retention) is False
     assert old_datadir.exists()
 
 
-def test_run_upgrade_keeps_old_datadir_when_retention_is_positive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_cleanup_now_if_zero_retention_is_a_noop_when_nothing_completed_yet(
+    tmp_path: Path,
 ) -> None:
-    """A positive window is the separate timer's job to enforce, once
-    calendar time actually elapses -- not this same run."""
-    old_datadir = tmp_path / "old"
-    new_datadir = tmp_path / "new"
-    _make_cluster(old_datadir, "15")
-
-    monkeypatch.setattr(upgrade, "resolve_transfer_mode", lambda *a, **k: "copy")
-    monkeypatch.setattr(upgrade, "initdb_new_cluster", lambda *a, **k: None)
-    monkeypatch.setattr(upgrade, "run_pg_upgrade", lambda **k: None)
-
-    upgrade.run_upgrade(
-        old_bindir="/old/bin",
-        new_bindir="/new/bin",
-        old_datadir=str(old_datadir),
-        new_datadir=str(new_datadir),
-        old_schema="15",
-        new_schema="16",
-        superuser="postgres",
-        completion_state_file=str(tmp_path / "completed.json"),
-        old_datadir_retention_days=30,
+    assert (
+        upgrade.cleanup_old_datadir_now_if_zero_retention(str(tmp_path / "nope.json"), 0) is False
     )
+
+
+def test_cleanup_now_if_zero_retention_never_removes_an_incomplete_attempts_directory(
+    tmp_path: Path,
+) -> None:
+    old_datadir = tmp_path / "old"
+    old_datadir.mkdir()
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    # Deliberately never completed.
+
+    assert upgrade.cleanup_old_datadir_now_if_zero_retention(state_file, 0) is False
     assert old_datadir.exists()
+
+
+def test_cleanup_now_if_zero_retention_handles_an_already_removed_directory_gracefully(
+    tmp_path: Path,
+) -> None:
+    old_datadir = tmp_path / "old"  # deliberately never created
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    upgrade.record_upgrade_attempt_completed(state_file)
+
+    assert upgrade.cleanup_old_datadir_now_if_zero_retention(state_file, 0) is False
+
+
+def test_cleanup_now_if_zero_retention_logs_and_swallows_a_real_removal_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A removal failure (e.g. a stale NFS handle, a permission issue)
+    must be visible in the journal, not silently discarded -- an
+    operator relying on retention=0 to reclaim disk space needs to know
+    when it isn't actually happening."""
+    old_datadir = tmp_path / "old"
+    old_datadir.mkdir()
+    state_file = str(tmp_path / "attempt.json")
+    upgrade.record_upgrade_attempt_started(state_file, str(old_datadir))
+    upgrade.record_upgrade_attempt_completed(state_file)
+
+    def fake_rmtree(path: str) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(upgrade.shutil, "rmtree", fake_rmtree)
+
+    with caplog.at_level("WARNING"):
+        result = upgrade.cleanup_old_datadir_now_if_zero_retention(state_file, 0)
+    assert result is False
+    assert any("denied" in r.message or "old" in r.message for r in caplog.records)

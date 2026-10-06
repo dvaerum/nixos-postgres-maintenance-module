@@ -15,12 +15,16 @@ icuDriftTest).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
 
 
 class VersionMismatchError(Exception):
@@ -57,6 +61,33 @@ class PgUpgradeFailedError(Exception):
     stderr: pg_upgrade's own exit status alone names none of the actual
     incompatibility (a leftover extension, a catalog mismatch) an
     operator needs to see to fix it."""
+
+
+class IdenticalDataDirectoriesError(Exception):
+    """Raised when old_datadir and new_datadir resolve to the exact
+    same path -- a real misconfiguration (oldDataDir and the configured
+    services.postgresql.dataDir happen to coincide), caught explicitly
+    and FIRST: without this check, new_datadir's own PG_VERSION (really
+    the old cluster's) would otherwise be silently read as "already
+    upgraded" by the idempotency gate below, absorbing the
+    misconfiguration into a silent no-op with zero diagnostic."""
+
+
+class IncompleteUpgradeError(Exception):
+    """Raised when new_datadir already exists because a PREVIOUS
+    pg_upgrade attempt got as far as initdb_new_cluster() but never
+    recorded a completed attempt -- i.e. run_pg_upgrade() itself failed
+    or the process was killed before it could finish. pg_upgrade cannot
+    resume into an already-touched target directory (confirmed in its
+    own documentation: a failed/interrupted run must be retried against
+    a freshly-initialized cluster, not resumed in place), so this is
+    never silently retried and never silently treated as "already
+    done" -- both would either risk a second pg_upgrade run against an
+    inconsistent target or a false, permanent "success" with the new
+    cluster left empty/partial and postgresql.service starting on top
+    of it with zero signal anything is wrong. Raised on EVERY
+    subsequent invocation until an operator manually inspects and
+    removes new_datadir."""
 
 
 def read_pg_version(datadir: str) -> str | None:
@@ -313,39 +344,78 @@ def run_pg_upgrade(
 
 
 @dataclass(frozen=True, slots=True)
-class UpgradeCompletion:
-    """What a later cleanup timer needs to know: which old data
-    directory is now eligible for removal, and when the upgrade that
-    made it eligible actually finished (docs/decisions/0011's
-    oldDataDirRetentionDays window is measured from this moment)."""
+class UpgradeAttempt:
+    """One upgrade attempt's recorded state -- written in two steps by
+    run_upgrade() below: record_upgrade_attempt_started() right before
+    initdb_new_cluster() ever touches new_datadir, then
+    record_upgrade_attempt_completed() only once run_pg_upgrade() has
+    actually succeeded. completed_at is None for an attempt that
+    started but never finished -- the one signal that tells a
+    genuinely-completed upgrade apart from new_datadir merely existing
+    because a previous attempt got partway through before failing (see
+    IncompleteUpgradeError)."""
 
     old_datadir: str
-    completed_at: datetime
+    started_at: datetime
+    completed_at: datetime | None
 
 
-def record_upgrade_completion(
-    state_file: str, old_datadir: str, *, now: datetime | None = None
-) -> None:
-    """Records that a pg_upgrade finished successfully. Written
-    atomically (temp file + os.replace, same directory) -- same pattern
-    as 0009's connection-limit state file: a process killed mid-write
-    must never leave a corrupt file behind for the retention timer
-    (docs/decisions/0011) to choke on later."""
-    moment = now if now is not None else datetime.now(UTC)
-    payload = json.dumps({"old_datadir": old_datadir, "completed_at": moment.isoformat()})
+def _write_state_atomically(state_file: str, payload: dict[str, object]) -> None:
+    """Shared atomic-write helper (temp file + os.replace, same
+    directory) -- same pattern as 0009's connection-limit state file: a
+    process killed mid-write must never leave a corrupt file behind for
+    a later read (the very next boot's idempotency gate, or the
+    retention timer) to choke on."""
     state_dir = os.path.dirname(state_file) or "."
-    fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix=".upgrade-completed-")
+    fd, tmp_path = tempfile.mkstemp(dir=state_dir, prefix=".upgrade-attempt-")
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(payload)
+            json.dump(payload, f)
         os.replace(tmp_path, state_file)
     except BaseException:
         os.remove(tmp_path)
         raise
 
 
-def read_upgrade_completion(state_file: str) -> UpgradeCompletion | None:
-    """None when no upgrade has completed yet (the common case, and the
+def record_upgrade_attempt_started(
+    state_file: str, old_datadir: str, *, now: datetime | None = None
+) -> None:
+    """Written BEFORE initdb_new_cluster() ever touches new_datadir --
+    the one fact run_upgrade() needs on a later invocation to tell "a
+    previous attempt started here" apart from "new_datadir just
+    happens to already exist for some unrelated reason" (see
+    run_upgrade()'s own docstring)."""
+    moment = now if now is not None else datetime.now(UTC)
+    _write_state_atomically(
+        state_file,
+        {"old_datadir": old_datadir, "started_at": moment.isoformat(), "completed_at": None},
+    )
+
+
+def record_upgrade_attempt_completed(state_file: str, *, now: datetime | None = None) -> None:
+    """Updates the SAME record record_upgrade_attempt_started() wrote,
+    setting completed_at -- called only once run_pg_upgrade() has
+    actually succeeded. Preserves the original old_datadir/started_at
+    rather than re-deriving them, so the one record always reflects
+    this attempt's full history."""
+    existing = read_upgrade_attempt(state_file)
+    assert existing is not None, (
+        f"{state_file} has no started attempt to complete -- "
+        "record_upgrade_attempt_started() must run first"
+    )
+    moment = now if now is not None else datetime.now(UTC)
+    _write_state_atomically(
+        state_file,
+        {
+            "old_datadir": existing.old_datadir,
+            "started_at": existing.started_at.isoformat(),
+            "completed_at": moment.isoformat(),
+        },
+    )
+
+
+def read_upgrade_attempt(state_file: str) -> UpgradeAttempt | None:
+    """None when no attempt has ever started (the common case, and the
     state before any upgrade.enable transition has ever run) -- not an
     error, same "missing means nothing to report yet" shape as
     read_pg_version() above."""
@@ -354,9 +424,12 @@ def read_upgrade_completion(state_file: str) -> UpgradeCompletion | None:
             data = json.load(f)
     except FileNotFoundError:
         return None
-    return UpgradeCompletion(
+    return UpgradeAttempt(
         old_datadir=data["old_datadir"],
-        completed_at=datetime.fromisoformat(data["completed_at"]),
+        started_at=datetime.fromisoformat(data["started_at"]),
+        completed_at=(
+            datetime.fromisoformat(data["completed_at"]) if data["completed_at"] else None
+        ),
     )
 
 
@@ -389,7 +462,6 @@ def run_upgrade(
     jobs: int | None = None,
     initdb_args: list[str] | None = None,
     completion_state_file: str,
-    old_datadir_retention_days: int | None = None,
 ) -> bool:
     """Top-level entry point for the postgresql-collation-guard-upgrade
     unit (ordered Before=["postgresql.service"] -- see
@@ -397,15 +469,34 @@ def run_upgrade(
     True iff an upgrade actually ran (and succeeded); False for every
     no-op case below.
 
-    Idempotent by construction, the ONE gate: new_datadir already
-    having its own PG_VERSION means an upgrade already ran here --
-    upgrade.enable can stay true indefinitely across any number of
-    subsequent boots with no repeat effect (docs/decisions/0011), no
-    separate "already ran" marker needed.
+    old_datadir == new_datadir is checked FIRST and raises
+    IdenticalDataDirectoriesError -- a real misconfiguration that, if
+    checked anywhere later, would already have been silently absorbed
+    by the idempotency gate below (new_datadir's PG_VERSION -- really
+    the OLD cluster's own, since they're the same path -- would read as
+    "already upgraded").
 
-    A missing old_datadir (no PG_VERSION at all) is a second, distinct
-    no-op: a brand-new host with upgrade.enable configured ahead of its
-    very first boot has nothing to upgrade *from* -- the upstream
+    Idempotent by construction once genuinely complete: new_datadir
+    already having its own PG_VERSION AND a matching completed attempt
+    on record means an upgrade already ran here -- upgrade.enable can
+    stay true indefinitely across any number of subsequent boots with
+    no repeat effect (docs/decisions/0011). But new_datadir having a
+    PG_VERSION with NO completed attempt on record is NOT treated the
+    same way:
+    - if an attempt was started but never completed, this raises
+      IncompleteUpgradeError every single time, rather than either
+      silently treating a failed migration as successful (the exact
+      gap this closes -- see IncompleteUpgradeError's own docstring)
+      or silently retrying pg_upgrade against an already-touched
+      target it cannot resume into.
+    - if there's no recorded attempt at all, new_datadir's PG_VERSION
+      came from somewhere entirely unrelated to this feature (e.g.
+      upgrade.enable was turned on after the new version was already
+      running normally) -- nothing to upgrade, a genuine no-op.
+
+    A missing old_datadir (no PG_VERSION at all) is a distinct no-op:
+    a brand-new host with upgrade.enable configured ahead of its very
+    first boot has nothing to upgrade *from* -- the upstream
     postgresql.service preStart initdb's new_datadir itself in that
     case, exactly as if upgrade.enable were false.
 
@@ -415,15 +506,33 @@ def run_upgrade(
     immediately, before anything downstream (even the no-op path) ever
     assumes old_schema is trustworthy.
 
-    old_datadir_retention_days=0 ("delete immediately", docs/decisions/
-    0011) is handled inline, in this same run, right here -- not
-    deferred to the separate cleanup timer cleanup_old_datadir_if_due()
-    exists for (see that function's own docstring for why a *positive*
-    window can't be handled this way). A failure removing it is logged
-    and swallowed, not allowed to turn an otherwise fully successful
-    upgrade into a failed run over what's now just disk-space cleanup.
+    Does NOT handle oldDataDirRetentionDays at all (including the "0 --
+    delete immediately" case) -- that's main.run()'s job now, called
+    only after a live connection to the new cluster has actually
+    succeeded (see docs/decisions/0011's own correction: deleting the
+    only remaining copy of the real data before the new cluster has
+    even been proven to start once was a real gap in the original
+    design).
     """
+    if old_datadir == new_datadir:
+        raise IdenticalDataDirectoriesError(
+            f"old and new data directories must not be the same path ({old_datadir}) -- "
+            "this is almost certainly a misconfiguration (upgrade.oldDataDir and the "
+            "configured services.postgresql.dataDir resolved to the same value)."
+        )
+
     if read_pg_version(new_datadir) is not None:
+        attempt = read_upgrade_attempt(completion_state_file)
+        if attempt is None:
+            return False
+        if attempt.completed_at is None:
+            raise IncompleteUpgradeError(
+                f"{new_datadir} already exists from a pg_upgrade attempt that started at "
+                f"{attempt.started_at.isoformat()} but never completed -- pg_upgrade cannot "
+                f"resume into an already-touched target directory. Inspect {new_datadir}, "
+                "remove it once you're sure nothing there is worth keeping, then reboot to "
+                "retry."
+            )
         return False
 
     if read_pg_version(old_datadir) is None:
@@ -440,6 +549,7 @@ def run_upgrade(
         new_datadir_parent=os.path.dirname(new_datadir),
     )
 
+    record_upgrade_attempt_started(completion_state_file, old_datadir)
     initdb_new_cluster(new_bindir, new_datadir, superuser, initdb_args=initdb_args)
     run_pg_upgrade(
         old_bindir=old_bindir,
@@ -450,10 +560,7 @@ def run_upgrade(
         superuser=superuser,
         jobs=jobs,
     )
-    record_upgrade_completion(completion_state_file, old_datadir)
-
-    if old_datadir_retention_days == 0:
-        shutil.rmtree(old_datadir, ignore_errors=True)
+    record_upgrade_attempt_completed(completion_state_file)
 
     return True
 
@@ -462,27 +569,79 @@ def cleanup_old_datadir_if_due(
     completion_state_file: str, retention_days: int | None, *, now: datetime | None = None
 ) -> bool:
     """The separate timer's own job (docs/decisions/0011): removes the
-    retained old data directory once oldDataDirRetentionDays's window
-    has elapsed. Can't be folded into run_upgrade() above for a
-    *positive* window -- that function only ever runs once, at upgrade
-    time, while a positive retention window is defined entirely in
-    terms of calendar time elapsing *afterward*, independent of any
-    particular boot. (retention_days=0 bypasses this function entirely
-    -- see run_upgrade()'s own inline handling for that case.)
+    retained old data directory once oldDataDirRetentionDays's *positive*
+    window has elapsed. Can't be folded into run_upgrade() above --
+    that function only ever runs once, at upgrade time, while a
+    positive retention window is defined entirely in terms of calendar
+    time elapsing *afterward*, independent of any particular boot.
+    (retention_days=0 is cleanup_old_datadir_now_if_zero_retention()'s
+    job instead -- see that function's own docstring for why.)
+
+    An incomplete attempt (completed_at is None) is NEVER eligible for
+    cleanup, regardless of retention_days or how much calendar time has
+    passed: it's the only copy of the real data left after a failed
+    migration, and IncompleteUpgradeError is what's supposed to force
+    manual intervention -- not an unattended rm -rf racing against an
+    operator trying to diagnose the failure.
 
     Returns True iff the directory was actually removed this call;
-    False for every no-op case: nothing recorded yet, not due yet, or
-    already removed by an earlier call of this same timer (rmtree's own
-    FileNotFoundError here is the expected steady state afterward, not
-    an error)."""
-    completion = read_upgrade_completion(completion_state_file)
-    if completion is None:
+    False for every no-op case: nothing recorded yet, not yet
+    completed, not due yet, or already removed by an earlier call of
+    this same timer (rmtree's own FileNotFoundError here is the
+    expected steady state afterward, not an error)."""
+    attempt = read_upgrade_attempt(completion_state_file)
+    if attempt is None or attempt.completed_at is None:
         return False
-    if not old_datadir_due_for_cleanup(completion.completed_at, retention_days, now=now):
+    if not old_datadir_due_for_cleanup(attempt.completed_at, retention_days, now=now):
         return False
     try:
-        shutil.rmtree(completion.old_datadir)
+        shutil.rmtree(attempt.old_datadir)
     except FileNotFoundError:
+        return False
+    return True
+
+
+def cleanup_old_datadir_now_if_zero_retention(
+    completion_state_file: str, retention_days: int | None
+) -> bool:
+    """The retention_days=0 ("delete immediately") case
+    (docs/decisions/0011) -- called by main.run(), AFTER it has already
+    proven the new cluster is up and reachable (a live connection
+    succeeded), NOT inline inside run_upgrade() itself. run_upgrade()
+    runs strictly before postgresql.service ever starts; deleting the
+    only remaining copy of the real data before the new cluster has
+    even been proven to start once -- which the original design did --
+    trades a one-time disk-space saving for total data loss if
+    postgresql.service then fails to start for any unrelated reason
+    (a bad setting, a missing extension introduced in the same
+    nixos-rebuild switch).
+
+    Same incomplete-attempt guard as cleanup_old_datadir_if_due() above
+    -- never removes an attempt that started but never completed.
+    Idempotent: a no-op on every boot after the first (rmtree's own
+    FileNotFoundError), so it's safe to call unconditionally on every
+    run() regardless of whether this is the first boot after the
+    upgrade or the hundredth.
+
+    A real removal failure is logged (not silently swallowed like the
+    original inline version this replaced) -- an operator relying on
+    retention=0 to reclaim disk space needs to know when it isn't
+    actually happening."""
+    if retention_days != 0:
+        return False
+    attempt = read_upgrade_attempt(completion_state_file)
+    if attempt is None or attempt.completed_at is None:
+        return False
+    try:
+        shutil.rmtree(attempt.old_datadir)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.warning(
+            "failed to remove retained old data directory %s (oldDataDirRetentionDays=0)",
+            attempt.old_datadir,
+            exc_info=True,
+        )
         return False
     return True
 

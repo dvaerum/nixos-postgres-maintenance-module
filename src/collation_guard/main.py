@@ -519,6 +519,8 @@ def run(
     lockdown_mechanism: str = "pg_hba",
     connection_limit_state_path: str | None = None,
     hook_timeout_sec: float = 90,
+    upgrade_completion_state_file: str | None = None,
+    upgrade_old_datadir_retention_days: int | None = None,
 ) -> RunReport:
     report = RunReport()
     hooks = hooks or HooksConfig()
@@ -581,6 +583,22 @@ def run(
                 report.failures.append(
                     Failure(database="template0", relation="template0", error=template0_error)
                 )
+
+        # Only reached once a live connection to THIS (the new, post-
+        # upgrade) cluster has actually succeeded above -- the
+        # verification oldDataDirRetentionDays=0's "delete immediately"
+        # promise depends on (docs/decisions/0011). Deliberately not
+        # inside upgrade.run_upgrade() itself, which runs strictly
+        # before postgresql.service ever starts and so can never prove
+        # the new cluster actually comes up. A no-op on every run after
+        # the first (idempotent -- see
+        # cleanup_old_datadir_now_if_zero_retention's own docstring),
+        # and a no-op entirely when upgrade_completion_state_file is
+        # unset (upgrade.enable was never turned on).
+        if upgrade_completion_state_file is not None:
+            upgrade.cleanup_old_datadir_now_if_zero_retention(
+                upgrade_completion_state_file, upgrade_old_datadir_retention_days
+            )
 
         glibc_reindexed = _process_glibc_stamp(host, port, glibc_locales_path, report, manager)
 
@@ -760,7 +778,6 @@ def run_upgrade_entrypoint(
     transfer_mode: str = "auto",
     jobs: int | None = None,
     initdb_args: list[str] | None = None,
-    old_datadir_retention_days: int | None = None,
 ) -> int:
     """Third entry point, invoked by the postgresql-collation-guard-
     upgrade.service unit -- ordered Before=["postgresql.service"]
@@ -769,12 +786,22 @@ def run_upgrade_entrypoint(
     run_on_failure() above, this never opens a live connection at all:
     pg_upgrade manages both clusters' startup/shutdown internally.
 
-    A VersionMismatchError raised by upgrade.run_upgrade() here is a
-    real, actionable misconfiguration (the on-disk old cluster isn't
-    what oldPackage claims) and is deliberately allowed to propagate as
-    an uncaught exception -- the same "crash loud, let the journal and
-    non-zero exit code carry it" behavior as every other hard failure
-    in this project, not swallowed into a quiet return 1."""
+    Deliberately does NOT handle oldDataDirRetentionDays -- not even
+    the "0, delete immediately" case. That's run()'s job now, called
+    only after a live connection to the new cluster has actually
+    succeeded: deleting the only remaining copy of the real data
+    before the new cluster has even been proven to start once (what
+    this unit did before this fix) trades a one-time disk-space saving
+    for total data loss if postgresql.service then fails to start for
+    any unrelated reason.
+
+    A VersionMismatchError/IdenticalDataDirectoriesError/
+    IncompleteUpgradeError raised by upgrade.run_upgrade() here is a
+    real, actionable misconfiguration or failure and is deliberately
+    allowed to propagate as an uncaught exception -- the same "crash
+    loud, let the journal and non-zero exit code carry it" behavior as
+    every other hard failure in this project, not swallowed into a
+    quiet return 1."""
     upgraded = upgrade.run_upgrade(
         old_bindir=old_bindir,
         new_bindir=new_bindir,
@@ -787,7 +814,6 @@ def run_upgrade_entrypoint(
         jobs=jobs,
         initdb_args=initdb_args,
         completion_state_file=completion_state_file,
-        old_datadir_retention_days=old_datadir_retention_days,
     )
     if upgraded:
         logger.info("pg_upgrade completed: %s -> %s", old_datadir, new_datadir)
@@ -870,7 +896,6 @@ def main() -> int:
     if args.upgrade:
         jobs_env = os.environ.get("COLLATION_GUARD_UPGRADE_JOBS")
         initdb_args_env = os.environ.get("COLLATION_GUARD_UPGRADE_INITDB_ARGS")
-        retention_env = os.environ.get("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS")
         return run_upgrade_entrypoint(
             old_bindir=os.environ["COLLATION_GUARD_UPGRADE_OLD_BINDIR"],
             new_bindir=os.environ["COLLATION_GUARD_UPGRADE_NEW_BINDIR"],
@@ -883,7 +908,6 @@ def main() -> int:
             transfer_mode=os.environ.get("COLLATION_GUARD_UPGRADE_TRANSFER_MODE", "auto"),
             jobs=int(jobs_env) if jobs_env else None,
             initdb_args=json.loads(initdb_args_env) if initdb_args_env else None,
-            old_datadir_retention_days=int(retention_env) if retention_env else None,
         )
 
     if args.on_failure:
@@ -902,6 +926,8 @@ def main() -> int:
     hooks_file = os.environ.get("COLLATION_GUARD_HOOKS_FILE")
     hooks = load_hooks(hooks_file) if hooks_file else None
 
+    upgrade_retention_env = os.environ.get("COLLATION_GUARD_UPGRADE_OLD_DATADIR_RETENTION_DAYS")
+
     report = run(
         os.environ["PGHOST"],
         os.environ["PGPORT"],
@@ -918,6 +944,12 @@ def main() -> int:
         lockdown_mechanism=os.environ.get("COLLATION_GUARD_LOCKDOWN_MECHANISM", "pg_hba"),
         connection_limit_state_path=os.environ.get("COLLATION_GUARD_CONNECTION_LIMIT_STATE_FILE"),
         hook_timeout_sec=hook_timeout_sec,
+        upgrade_completion_state_file=os.environ.get(
+            "COLLATION_GUARD_UPGRADE_COMPLETION_STATE_FILE"
+        ),
+        upgrade_old_datadir_retention_days=(
+            int(upgrade_retention_env) if upgrade_retention_env else None
+        ),
     )
 
     if args.dry_run:
