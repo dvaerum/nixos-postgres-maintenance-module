@@ -236,18 +236,26 @@ services.postgresqlCollationGuard.upgrade = {
 `upgrade.enable` must be set explicitly -- unlike the always-on
 collation guard above, this is a one-way data migration, never
 triggered automatically just because `services.postgresql.package`'s
-major version differs from what's on disk. It's also idempotent by
-construction: safe to leave `enable = true` indefinitely across any
-number of subsequent `nixos-rebuild switch`es once the upgrade has
-actually completed, since the only gate is whether the *new* data
-directory already has its own cluster. A new
+major version differs from what's on disk. (Also requires
+`services.postgresqlCollationGuard.enable = true` -- upgrade is a
+sub-feature of this module, not a standalone one; evaluation asserts
+this explicitly rather than silently no-op-ing if you forget.) It's
+also idempotent once genuinely complete: safe to leave `enable = true`
+indefinitely across any number of subsequent `nixos-rebuild switch`es
+once the upgrade has actually succeeded. A failed attempt is never
+silently mistaken for a successful one, either -- if `pg_upgrade`
+itself fails partway, the next boot raises loudly instead of starting
+`postgresql.service` against an empty/partial cluster, until the
+new data directory is manually inspected and removed. A new
 `postgresql-collation-guard-upgrade.service` unit runs strictly
 *before* `postgresql.service` starts (the opposite ordering from the
 main guard above, which needs a live connection) -- initializing the
 new data directory and running the real `pg_upgrade` binary, so
 `postgresql.service`'s own first-boot `initdb` never gets a chance to
 silently create an empty cluster at the new version's data directory
-path first.
+path first. If the upgrade unit fails for any reason,
+`postgresql.service` is blocked from starting at all, rather than
+risking it starting against a half-migrated directory.
 
 The old data directory is kept after a successful upgrade, by default
 forever -- `pg_upgrade`'s own documentation recommends keeping it until
